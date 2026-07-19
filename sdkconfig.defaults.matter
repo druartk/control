@@ -1,0 +1,57 @@
+CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL=y
+CONFIG_CONTROL_MATTER_ALLOW_UNTRUSTED_ATTESTATION=y
+
+# The password-entry partial refresh path is disabled for the Matter
+# experimental build. On the physical panel it produced overdraw/ghosting in
+# the keyboard and password field. Keep the code available, but prefer clean
+# full-screen password redraws for this build.
+# CONFIG_CONTROL_ENABLE_PARTIAL_REFRESH is not set
+# CONFIG_CONTROL_PASSWORD_FIELD_PARTIAL_REFRESH is not set
+# CONFIG_CONTROL_PASSWORD_KEYBOARD_PARTIAL_REFRESH is not set
+
+# ESP-Matter controller/commissioner requirements. This project targets
+# on-network commissioning first because DIRIGERA is already on the LAN.
+# Keep BLE disabled for this experimental build unless a future commissioning
+# path explicitly requires it.
+# CONFIG_BT_ENABLED is not set
+# CONFIG_BT_NIMBLE_ENABLED is not set
+# CONFIG_ENABLE_CHIPOBLE is not set
+# CONFIG_ENABLE_ESP32_BLE_CONTROLLER is not set
+# CONFIG_USE_BLE_ONLY_FOR_COMMISSIONING is not set
+
+CONFIG_ENABLE_CHIP_SHELL=n
+CONFIG_ENABLE_CHIP_CONTROLLER_BUILD=y
+CONFIG_ESP_MATTER_CONTROLLER_ENABLE=y
+CONFIG_ESP_MATTER_COMMISSIONER_ENABLE=y
+CONFIG_ESP_MATTER_ENABLE_MATTER_SERVER=n
+CONFIG_WIFI_NETWORK_COMMISSIONING_DRIVER=n
+CONFIG_MBEDTLS_HKDF_C=y
+CONFIG_NUM_UDP_ENDPOINTS=16
+CONFIG_CHIP_TASK_STACK_SIZE=15360
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+CONFIG_LWIP_HOOK_IP6_ROUTE_DEFAULT=y
+CONFIG_LWIP_HOOK_ND6_GET_GW_DEFAULT=y
+CONFIG_LWIP_IPV6_AUTOCONFIG=y
+CONFIG_LWIP_IPV6_NUM_ADDRESSES=6
+CONFIG_LWIP_SNTP_MAX_SERVERS=3
+CONFIG_CHIP_PROJECT_CONFIG="main/matter_project_config.h"
+
+# Reduce Wi-Fi internal RAM pressure before Matter DeviceControllerFactory init.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_MGMT_SBUF_NUM=16
+# CONFIG_ESP_WIFI_AMPDU_TX_ENABLED is not set
+# CONFIG_ESP_WIFI_AMPDU_RX_ENABLED is not set
+
+# Keep current hardware flash size; partition size will be validated by build.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# Matter controller builds need substantially more app and NVS space than the
+# safe hardware-validation build. Keep this partition table scoped to builds
+# that include sdkconfig.defaults.matter.
+# CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE is not set
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_matter.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_matter.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000

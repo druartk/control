@@ -1,0 +1,7 @@
+# Experimental ESP-Matter partition table for LILYGO T5 4.7 Plus V2.4.
+# 16 MB flash device. No OTA layout yet; keep this separate from the safe build.
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x10000,
+phy_init, data, phy,     0x19000,  0x1000,
+factory,  app,  factory, 0x20000,  0x300000,
+storage,  data, spiffs,          , 0x100000,

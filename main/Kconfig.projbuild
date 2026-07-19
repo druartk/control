@@ -1,0 +1,156 @@
+menu "Control diagnostics"
+
+config CONTROL_IKEA_DISCOVERY
+    bool "Enable IKEA/DIRIGERA local network discovery"
+    default y
+    help
+        Enables the bounded local-network discovery worker used after Wi-Fi
+        connection. This does not implement Matter commissioning.
+
+config CONTROL_IKEA_MDNS_DISCOVERY
+    bool "Enable IKEA/DIRIGERA mDNS and DNS-SD discovery"
+    depends on CONTROL_IKEA_DISCOVERY
+    default y
+    help
+        Uses the official Espressif mdns component to browse local services and
+        resolve hostnames. Disable this if the managed mdns component is not
+        available in the build environment.
+
+config CONTROL_IKEA_HOSTNAME_FALLBACK
+    bool "Enable IKEA/DIRIGERA hostname fallback"
+    depends on CONTROL_IKEA_DISCOVERY
+    default y
+    help
+        Attempts conservative hostname resolution for known DIRIGERA name
+        variants after DNS-SD browsing.
+
+config CONTROL_IKEA_IP_DIAGNOSTICS
+    bool "Enable IKEA/DIRIGERA IP diagnostics"
+    depends on CONTROL_IKEA_DISCOVERY
+    default y
+    help
+        Logs local IP, gateway, netmask, DNS, RSSI, and MAC information before
+        discovery so router and subnet issues can be diagnosed.
+
+config CONTROL_IKEA_KNOWN_IP
+    string "Known IKEA/DIRIGERA diagnostic IP"
+    depends on CONTROL_IKEA_DISCOVERY
+    default "192.168.50.116"
+    help
+        Optional known IP to probe during IKEA discovery. A reachable IP is
+        classified as unconfirmed unless mDNS/DNS-SD or hostname data clearly
+        identifies IKEA, DIRIGERA, or hubv3.
+
+config CONTROL_NET_DIAG_PING_SWEEP
+    bool "Enable diagnostic LAN ping sweep"
+    depends on CONTROL_IKEA_DISCOVERY
+    default n
+    help
+        Development-only network diagnostic for future use. When enabled, the
+        discovery worker may scan a /24 subnet with short ping timeouts, but
+        ping reachability alone must never classify a host as IKEA.
+
+config CONTROL_MATTER_CONTROLLER
+    bool "Enable Control Matter controller abstraction"
+    default y
+    help
+        Builds the Control-side Matter controller interface and UI flow. This
+        option alone does not link ESP-Matter and does not run commissioning.
+
+config CONTROL_MATTER_COMMISSIONING
+    bool "Enable Matter commissioning UI flow"
+    depends on CONTROL_MATTER_CONTROLLER
+    default y
+    help
+        Enables screens and state transitions that prepare a manual Matter code
+        for commissioning. Real commissioning remains blocked unless the
+        experimental commissioning option is also enabled and ESP-Matter is
+        integrated.
+
+config CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL
+    bool "Enable experimental real ESP-Matter commissioning"
+    depends on CONTROL_MATTER_COMMISSIONING
+    default n
+    help
+        Development-only gate for real ESP-Matter controller/commissioner
+        integration. When disabled, pressing Continue after a valid Matter code
+        shows a clear placeholder and no Matter stack action is attempted.
+
+config CONTROL_MATTER_ALLOW_UNTRUSTED_ATTESTATION
+    bool "Allow untrusted Matter device attestation"
+    depends on CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL
+    default n
+    help
+        Development only. Allows commissioning even when device attestation
+        cannot be verified due to missing PAA trust store / DCL. Do not use
+        for production.
+
+config CONTROL_TOUCH_UI_DISPATCH
+    bool "Enable minimal touch-driven UI dispatch"
+    default y
+    help
+        Enables PRESS-only dispatch from the GT911 event queue to the UI hit
+        tester. MOVE and RELEASE never request screen redraws. Display refreshes
+        remain owned by the app/UI loop and occur only on explicit state changes.
+
+config CONTROL_TOUCH_DEBUG
+    bool "Verbose touch movement diagnostics"
+    default y
+    help
+        Log meaningful GT911 MOVE events in addition to PRESS and RELEASE.
+        Idle polling is never logged.
+
+config CONTROL_TOUCH_TASK_STACK_SIZE
+    int "Control touch task stack size (bytes)"
+    default 4096
+    range 3072 8192
+    help
+        Stack reserved for GT911 polling and I2C reads. Units are bytes.
+
+config CONTROL_ENABLE_PARTIAL_REFRESH
+    bool "Enable experimental partial e-paper refresh"
+    default y
+    help
+        Enables the experimental region commit path. Full screen transitions
+        keep using the known-good full refresh sequence.
+
+config CONTROL_PASSWORD_FIELD_PARTIAL_REFRESH
+    bool "Use partial refresh for Wi-Fi password field"
+    depends on CONTROL_ENABLE_PARTIAL_REFRESH
+    default y
+    help
+        Updates only the password field rectangle while typing. If disabled or
+        if the partial refresh fails, key presses update the internal password
+        buffer without triggering a full-screen refresh.
+
+config CONTROL_PASSWORD_KEYBOARD_PARTIAL_REFRESH
+    bool "Use partial refresh for Wi-Fi password keyboard"
+    depends on CONTROL_ENABLE_PARTIAL_REFRESH
+    default y
+    help
+        Updates only the keyboard rectangle when switching lowercase,
+        uppercase, and symbol keyboard layouts. If disabled or unsupported,
+        keyboard mode changes update internal state only and do not trigger a
+        full-screen refresh per mode change.
+
+config CONTROL_PASSWORD_REFRESH_EVERY_N_KEYS
+    int "Password field refresh interval in key presses"
+    depends on CONTROL_PASSWORD_FIELD_PARTIAL_REFRESH
+    default 1
+    range 1 8
+    help
+        Number of normal character key presses to batch before refreshing the
+        password field region. Backspace and clear force an immediate field
+        refresh.
+
+config CONTROL_PASSWORD_PARTIALS_BEFORE_FULL_REFRESH
+    int "Password partial refreshes before a full password-screen cleanup"
+    depends on CONTROL_PASSWORD_FIELD_PARTIAL_REFRESH
+    default 20
+    range 1 100
+    help
+        Number of successful password-field partial refreshes before scheduling
+        one full refresh of the password screen to limit ghosting. The cleanup
+        full refresh is only performed while the password screen is still active.
+
+endmenu
