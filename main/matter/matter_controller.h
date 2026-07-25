@@ -118,7 +118,6 @@ esp_err_t matter_controller_reset_controller_init_failure();
 void matter_controller_dump_local_storage_summary();
 uint64_t matter_controller_get_preferred_remote_node_id();
 void matter_controller_set_pending_commissioning_mode(bool multi_admin);
-esp_err_t matter_controller_mdns_prescan(bool &foundAny, uint32_t timeoutMs = 3000);
 esp_err_t matter_controller_validate_saved_node_fabric();
 esp_err_t matter_controller_commission_with_manual_code(
     const std::string &normalizedCode,

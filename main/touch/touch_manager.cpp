@@ -176,8 +176,8 @@ bool TouchManager::initialize() {
              CONTROL_BOARD_TOUCH_SCL, CONTROL_BOARD_TOUCH_IRQ);
     ESP_LOGI(TAG, "IRQ47 initial=%d pull=external-4.7k/internal-disabled edge=ANYEDGE",
              lastIrqLevel_);
-    ESP_LOGI(TAG, "mode=Polling with IRQ hint interval=%lldms",
-             static_cast<long long>(POLL_INTERVAL_US / 1000));
+    ESP_LOGI(TAG, "mode=Polling with IRQ hint interval=%lu ms",
+             static_cast<unsigned long>(POLL_INTERVAL_US / 1000));
     ESP_LOGI(TAG, "pipeline: Controller detected=yes; Coordinates readable=pending; "
                   "Events working=pending; UI dispatch working=pending");
     return true;

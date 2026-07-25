@@ -7,6 +7,7 @@
 #include "display/display_manager.h"
 #include "ikea/ikea_discovery.h"
 #include "matter/matter_controller.h"
+#include "weather/weather_manager.h"
 #include "wifi/wifi_manager.h"
 
 enum class UiActionType {
@@ -47,12 +48,31 @@ enum class UiActionType {
     MATTER_FORGET,
     MATTER_FORGET_CONFIRM,
     MATTER_RESTART,
+    OPEN_HOME,
+    OPEN_WEATHER,
+    OPEN_ROOM,
+    ROOM_ON,
+    ROOM_OFF,
+    ROOM_DETAIL,
+    DIAGNOSTIC,
+    WEATHER_REFRESH,
+    DISCOVER_DEVICES,
+    PAIR_MATTER,
+    RESET_MATTER,
 };
 
 struct UiAction {
     UiActionType type = UiActionType::NONE;
     int index = -1;
     char character = 0;
+};
+
+struct RoomGroup {
+    char name[32] = {};
+    uint16_t endpoint_ids[16] = {};
+    uint8_t endpoint_count = 0;
+    uint8_t lights_on_count = 0;
+    uint8_t controllable_count = 0;
 };
 
 struct UiViewModel {
@@ -101,6 +121,14 @@ struct UiViewModel {
     MatterPostCommissioningResult matterPost;
     size_t matterDevicePage = 0;
     int selectedMatterDevice = -1;
+    WeatherCurrent weatherCurrent;
+    std::vector<WeatherForecastDay> weatherForecast;
+    bool weatherRefreshing = false;
+    bool wifiConfigured = false;
+    bool matterEarlyInitFailed = false;
+    std::vector<RoomGroup> rooms;
+    int selectedRoom = -1;
+    size_t roomPage = 0;
 };
 
 class UiManager {
@@ -122,6 +150,10 @@ private:
     void renderKeyboard(const UiViewModel &model);
     void renderMatterCodeEntry(const UiViewModel &model);
     void renderMatterCodeField(const UiViewModel &model);
+    void renderWeather(const UiViewModel &model);
+    void renderHomeControl(const UiViewModel &model);
+    void renderRoomDetail(const UiViewModel &model);
+    void renderSettings(const UiViewModel &model);
     UiAction hitTestInternal(const UiViewModel &model, int x, int y) const;
     static std::string signalBars(int rssi);
     static std::string maskedPassword(size_t length);

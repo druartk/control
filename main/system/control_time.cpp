@@ -1,5 +1,8 @@
 #include "system/control_time.h"
 
+#include <cstddef>
+#include <cstdio>
+#include <cstdint>
 #include <ctime>
 
 #include "esp_log.h"
@@ -11,14 +14,54 @@ constexpr const char *TAG = "CONTROL_TIME";
 constexpr time_t MIN_REASONABLE_TIME = 1704067200; // 2024-01-01T00:00:00Z
 bool g_sntpStarted = false;
 
+void formatUnixTime(time_t value, char *buffer, size_t bufferSize) {
+    if (buffer == nullptr || bufferSize == 0) return;
+    buffer[0] = '\0';
+
+    bool negative = value < 0;
+    uint64_t remaining = 0;
+    if (negative) {
+        remaining = static_cast<uint64_t>(-(value + 1)) + 1U;
+    } else {
+        remaining = static_cast<uint64_t>(value);
+    }
+
+    char digits[24] = {};
+    size_t digitCount = 0;
+    do {
+        digits[digitCount++] = static_cast<char>('0' + (remaining % 10U));
+        remaining /= 10U;
+    } while (remaining > 0 && digitCount < sizeof(digits));
+
+    size_t out = 0;
+    if (negative && out + 1 < bufferSize) {
+        buffer[out++] = '-';
+    }
+    while (digitCount > 0 && out + 1 < bufferSize) {
+        buffer[out++] = digits[--digitCount];
+    }
+    buffer[out] = '\0';
+}
+
+void formatUtc(time_t now, char *buffer, size_t bufferSize) {
+    if (buffer == nullptr || bufferSize == 0) return;
+    buffer[0] = '\0';
+
+    struct tm tm_utc {};
+    bool have_tm = gmtime_r(&now, &tm_utc) != nullptr;
+    if (have_tm && strftime(buffer, bufferSize, "%Y-%m-%dT%H:%M:%SZ", &tm_utc) > 0) {
+        return;
+    }
+    snprintf(buffer, bufferSize, "invalid");
+}
+
 void logCurrentUtc() {
     time_t now = 0;
     time(&now);
-    struct tm utc {};
-    gmtime_r(&now, &utc);
-    char buffer[32];
-    strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &utc);
-    ESP_LOGI(TAG, "time_sync_success utc=%s", buffer);
+
+    char utc_buf[32] = {};
+    formatUtc(now, utc_buf, sizeof(utc_buf));
+    ESP_LOGI(TAG, "time_sync_success utc=%s", utc_buf);
 }
 }
 
@@ -30,7 +73,12 @@ bool control_time_has_valid_utc() {
     time_t now = 0;
     time(&now);
     const bool valid = now >= MIN_REASONABLE_TIME;
-    ESP_LOGI(TAG, "unix_time=%lld valid_utc=%s", static_cast<long long>(now), valid ? "yes" : "no");
+
+    char unix_buf[24] = {};
+    char utc_buf[32] = {};
+    formatUnixTime(now, unix_buf, sizeof(unix_buf));
+    formatUtc(now, utc_buf, sizeof(utc_buf));
+    ESP_LOGI(TAG, "unix_time=%s utc=%s valid_utc=%s", unix_buf, utc_buf, valid ? "yes" : "no");
     return valid;
 }
 

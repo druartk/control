@@ -25,6 +25,7 @@ public:
 
     bool initialize();
     bool available() const { return available_; }
+    bool busy() const { return refreshState_ != RefreshState::READY; }
     const void *framebufferAddress() const { return framebuffer_; }
     const char *statusText() const { return status_.c_str(); }
 

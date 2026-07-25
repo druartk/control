@@ -1,5 +1,13 @@
 menu "Control diagnostics"
 
+config CONTROL_RECOVERY_BUILD
+    bool "Build conservative recovery firmware"
+    default n
+    help
+        Restricts startup to NVS, display, touch, Wi-Fi, and the setup UI.
+        Matter, IKEA discovery, mDNS, and early network workers remain
+        disabled until the base firmware is stable.
+
 config CONTROL_IKEA_DISCOVERY
     bool "Enable IKEA/DIRIGERA local network discovery"
     default y
@@ -7,14 +15,13 @@ config CONTROL_IKEA_DISCOVERY
         Enables the bounded local-network discovery worker used after Wi-Fi
         connection. This does not implement Matter commissioning.
 
-config CONTROL_IKEA_MDNS_DISCOVERY
-    bool "Enable IKEA/DIRIGERA mDNS and DNS-SD discovery"
+config CONTROL_IKEA_LEGACY_MDNS_DISCOVERY
+    bool "Enable legacy IKEA/DIRIGERA mDNS and DNS-SD discovery"
     depends on CONTROL_IKEA_DISCOVERY
     default y
     help
-        Uses the official Espressif mdns component to browse local services and
-        resolve hostnames. Disable this if the managed mdns component is not
-        available in the build environment.
+        Enables IKEA/DIRIGERA DNS-SD browsing through the shared ESP-IDF mDNS
+        backend. Matter builds must use CONFIG_USE_MINIMAL_MDNS=n.
 
 config CONTROL_IKEA_HOSTNAME_FALLBACK
     bool "Enable IKEA/DIRIGERA hostname fallback"

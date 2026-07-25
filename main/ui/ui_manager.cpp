@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <ctime>
 #include "esp_err.h"
 #include "esp_app_desc.h"
 #include "esp_log.h"
@@ -50,6 +51,16 @@ UiAction action(UiActionType type, int index = -1, char character = 0) {
     return UiAction{type, index, character};
 }
 
+std::string weatherClock(uint64_t timestamp) {
+    if (timestamp == 0) return "--:--";
+    const time_t value = static_cast<time_t>(timestamp);
+    struct tm calendar = {};
+    localtime_r(&value, &calendar);
+    char text[24] = {};
+    strftime(text, sizeof(text), "%H:%M  %d/%m", &calendar);
+    return text;
+}
+
 const char *actionName(UiActionType type) {
     switch (type) {
         case UiActionType::NONE: return "NONE";
@@ -89,6 +100,17 @@ const char *actionName(UiActionType type) {
         case UiActionType::MATTER_FORGET: return "MATTER_FORGET";
         case UiActionType::MATTER_FORGET_CONFIRM: return "MATTER_FORGET_CONFIRM";
         case UiActionType::MATTER_RESTART: return "MATTER_RESTART";
+        case UiActionType::OPEN_HOME: return "OPEN_HOME";
+        case UiActionType::OPEN_WEATHER: return "OPEN_WEATHER";
+        case UiActionType::OPEN_ROOM: return "OPEN_ROOM";
+        case UiActionType::ROOM_ON: return "ROOM_ON";
+        case UiActionType::ROOM_OFF: return "ROOM_OFF";
+        case UiActionType::ROOM_DETAIL: return "ROOM_DETAIL";
+        case UiActionType::DIAGNOSTIC: return "DIAGNOSTIC";
+        case UiActionType::WEATHER_REFRESH: return "WEATHER_REFRESH";
+        case UiActionType::DISCOVER_DEVICES: return "DISCOVER_DEVICES";
+        case UiActionType::PAIR_MATTER: return "PAIR_MATTER";
+        case UiActionType::RESET_MATTER: return "RESET_MATTER";
     }
     return "UNKNOWN";
 }
@@ -104,6 +126,10 @@ bool UiManager::render(const UiViewModel &m) {
             display_.text(40, 155, "Initialisation du contrôleur...");
             display_.text(40, 225, "Diagnostic matériel en cours");
             break;
+        case AppState::WEATHER_HOME: renderWeather(m); break;
+        case AppState::HOME_CONTROL: renderHomeControl(m); break;
+        case AppState::ROOM_DETAIL: renderRoomDetail(m); break;
+        case AppState::SETTINGS_DIAGNOSTIC: renderSettings(m); break;
         case AppState::HARDWARE_TEST: renderDiagnostics(m); break;
         case AppState::WIFI_SCANNING:
             display_.title("Recherche Wi-Fi");
@@ -306,7 +332,7 @@ bool UiManager::render(const UiViewModel &m) {
                     ? "Mémoire interne insuffisante"
                     : m.matterPost.errorText, 62);
             display_.button({35, 405, 260, 70}, "Réessayer", true);
-            display_.button({325, 405, 250, 70}, "Reset local");
+            display_.button({325, 405, 250, 70}, "Diagnostic");
             display_.button({610, 405, 315, 70}, "Retour");
             break;
         case AppState::MATTER_SAVED_INVALID:
@@ -476,6 +502,97 @@ void UiManager::renderDiagnostics(const UiViewModel &m) {
         "\nTactile : " + m.touchStatus + "\nWi-Fi : " + m.wifiStatus +
         "\nFirmware : " CONTROL_FW_VERSION "  IDF " + std::string(app->idf_ver), 55);
     display_.button(WIFI_BUTTON, "Configurer le Wi-Fi", true);
+}
+
+void UiManager::renderWeather(const UiViewModel &m) {
+    display_.text(28, 42, "Météo");
+    display_.text(250, 42, weatherClock(m.weatherCurrent.updated_at));
+    display_.text(620, 42, m.wifiConfigured ? "Wi-Fi OK" : "Wi-Fi requis");
+    display_.text(790, 42, m.matterSavedState == MatterSavedState::Valid ? "Matter OK" : "Matter --");
+    display_.line(24, 58, 936, 58);
+    if (!m.weatherCurrent.valid) {
+        display_.multiline(55, 175, "Météo indisponible\nWi-Fi requis", 64);
+        display_.button({55, 330, 300, 76}, m.wifiConfigured ? "Rafraîchir" : "Configurer Wi-Fi", true);
+    } else {
+        display_.text(55, 150, std::to_string(m.weatherCurrent.temperature_c) + " C");
+        display_.text(55, 205, m.weatherCurrent.condition);
+        display_.text(55, 255, std::string(m.weatherCurrent.location));
+        display_.text(390, 155, "Min " + std::to_string(m.weatherCurrent.temp_min_c) + " C   Max " +
+                     std::to_string(m.weatherCurrent.temp_max_c) + " C");
+        display_.text(390, 205, "Précipitations " + std::to_string(m.weatherCurrent.precipitation_percent) + " %");
+        display_.text(390, 255, "Vent " + std::to_string(m.weatherCurrent.wind_kmh) + " km/h");
+        size_t count = std::min<size_t>(3, m.weatherForecast.size());
+        for (size_t i = 0; i < count; ++i) {
+            const auto &day = m.weatherForecast[i];
+            UiRect card{35 + static_cast<int>(i) * 300, 290, 280, 100};
+            display_.rectangle(card);
+            display_.text(card.x + 15, card.y + 30, day.label);
+            display_.text(card.x + 15, card.y + 68, std::to_string(day.temp_min_c) + " / " +
+                         std::to_string(day.temp_max_c) + " C   " + std::to_string(day.precipitation_percent) + "%");
+        }
+    }
+    display_.button({35, 445, 430, 70}, m.matterEarlyInitFailed ? "Matter indisponible" : "Maison", true);
+    display_.button({490, 445, 200, 70}, "Rafraîchir");
+    display_.text(705, 485, m.weatherRefreshing ? "Mise à jour..." : "Actualisé");
+}
+
+void UiManager::renderHomeControl(const UiViewModel &m) {
+    display_.title("Maison");
+    if (m.rooms.empty()) display_.text(40, 150, "Aucun appareil connu");
+    for (size_t i = 0; i < m.rooms.size() && i < 4; ++i) {
+        const auto &room = m.rooms[i];
+        const int x = 30 + static_cast<int>(i % 2) * 465;
+        const int y = 95 + static_cast<int>(i / 2) * 155;
+        display_.rectangle({x, y, 435, 135});
+        display_.text(x + 18, y + 32, room.name);
+        display_.text(x + 18, y + 68, std::to_string(room.lights_on_count) + "/" +
+                     std::to_string(room.controllable_count) + " allumées");
+        display_.button({x + 18, y + 82, 105, 40}, "On");
+        display_.button({x + 132, y + 82, 105, 40}, "Off");
+        display_.button({x + 255, y + 82, 145, 40}, "Détails");
+    }
+    display_.button({30, 465, 200, 55}, "Météo");
+    display_.button({250, 465, 290, 55}, "Rafraîchir");
+    display_.button({560, 465, 365, 55}, "Diagnostic");
+}
+
+void UiManager::renderRoomDetail(const UiViewModel &m) {
+    display_.title(m.selectedRoom >= 0 && m.selectedRoom < static_cast<int>(m.rooms.size())
+        ? m.rooms[m.selectedRoom].name : "Pièce");
+    if (m.selectedRoom >= 0 && m.selectedRoom < static_cast<int>(m.rooms.size())) {
+        const auto &room = m.rooms[m.selectedRoom];
+        for (size_t i = 0; i < room.endpoint_count; ++i) {
+            const uint16_t endpoint = room.endpoint_ids[i];
+            for (const auto &device : m.matterPost.devices) if (device.endpoint_id == endpoint) {
+                const int y = 92 + static_cast<int>(i) * 66;
+                display_.rectangle({30, y, 900, 56});
+                display_.text(48, y + 37, device.name.empty() ? ("Endpoint " + std::to_string(endpoint)) : device.name);
+                display_.text(540, y + 37, device.onoff_state_known ? (device.onoff_state ? "Allumé" : "Éteint") : "État ?");
+                display_.button({730, y + 7, 85, 42}, "On");
+                display_.button({825, y + 7, 85, 42}, "Off");
+                break;
+            }
+        }
+    }
+    display_.button({30, 445, 180, 70}, "Tout On");
+    display_.button({225, 445, 180, 70}, "Tout Off");
+    display_.button({420, 445, 150, 70}, "Préc.");
+    display_.button({585, 445, 150, 70}, "Suiv.");
+    display_.button({750, 445, 180, 70}, "Retour");
+}
+
+void UiManager::renderSettings(const UiViewModel &m) {
+    display_.title("Diagnostic");
+    display_.multiline(35, 115, std::string("Wi-Fi connecté : ") + (m.connection.hasIpv4 ? "oui" : "non") +
+        "\nIP : " + m.connection.ipv4 + "\nMatter appairé : " +
+        (m.matterSavedState == MatterSavedState::Valid ? "oui" : "non") +
+        "\nNode distant : " + std::to_string(static_cast<unsigned long long>(m.matterSavedNode.node_id)) +
+        "\nCache appareils : " + std::to_string(m.matterPost.devices.size()), 46);
+    display_.button({35, 365, 260, 55}, "Rafraîchir météo");
+    display_.button({315, 365, 260, 55}, "Rafraîchir appareils");
+    display_.button({595, 365, 330, 55}, "Réappairer Matter");
+    display_.button({35, 435, 260, 55}, "Reset Matter local");
+    display_.button({315, 435, 260, 55}, "Retour");
 }
 
 void UiManager::renderNetworks(const UiViewModel &m) {
@@ -693,6 +810,36 @@ UiAction UiManager::hitTest(const UiViewModel &m, int x, int y) const {
 
 UiAction UiManager::hitTestInternal(const UiViewModel &m, int x, int y) const {
     switch (m.state) {
+        case AppState::WEATHER_HOME:
+            if (UiRect{35, 445, 430, 70}.contains(x, y)) return action(UiActionType::OPEN_HOME);
+            if (UiRect{490, 445, 200, 70}.contains(x, y)) return action(UiActionType::WEATHER_REFRESH);
+            if (UiRect{55, 330, 300, 76}.contains(x, y)) return m.wifiConfigured
+                ? action(UiActionType::WEATHER_REFRESH) : action(UiActionType::CONFIGURE_WIFI);
+            break;
+        case AppState::HOME_CONTROL:
+            if (UiRect{30, 465, 200, 55}.contains(x, y)) return action(UiActionType::OPEN_WEATHER);
+            if (UiRect{250, 465, 290, 55}.contains(x, y)) return action(UiActionType::DISCOVER_DEVICES);
+            if (UiRect{560, 465, 365, 55}.contains(x, y)) return action(UiActionType::DIAGNOSTIC);
+            for (size_t i = 0; i < m.rooms.size() && i < 4; ++i) {
+                const int rx = 30 + static_cast<int>(i % 2) * 465;
+                const int ry = 95 + static_cast<int>(i / 2) * 155;
+                if (UiRect{rx + 18, ry + 82, 105, 40}.contains(x, y)) return action(UiActionType::ROOM_ON, static_cast<int>(i));
+                if (UiRect{rx + 132, ry + 82, 105, 40}.contains(x, y)) return action(UiActionType::ROOM_OFF, static_cast<int>(i));
+                if (UiRect{rx + 255, ry + 82, 145, 40}.contains(x, y)) return action(UiActionType::ROOM_DETAIL, static_cast<int>(i));
+            }
+            break;
+        case AppState::ROOM_DETAIL:
+            if (UiRect{30, 445, 180, 70}.contains(x, y)) return action(UiActionType::ROOM_ON);
+            if (UiRect{225, 445, 180, 70}.contains(x, y)) return action(UiActionType::ROOM_OFF);
+            if (UiRect{750, 445, 180, 70}.contains(x, y)) return action(UiActionType::OPEN_HOME);
+            break;
+        case AppState::SETTINGS_DIAGNOSTIC:
+            if (UiRect{35, 365, 260, 55}.contains(x, y)) return action(UiActionType::WEATHER_REFRESH);
+            if (UiRect{315, 365, 260, 55}.contains(x, y)) return action(UiActionType::DISCOVER_DEVICES);
+            if (UiRect{595, 365, 330, 55}.contains(x, y)) return action(UiActionType::PAIR_MATTER);
+            if (UiRect{35, 435, 260, 55}.contains(x, y)) return action(UiActionType::RESET_MATTER);
+            if (UiRect{315, 435, 260, 55}.contains(x, y)) return action(UiActionType::OPEN_HOME);
+            break;
         case AppState::HARDWARE_TEST:
             if (WIFI_BUTTON.contains(x, y)) return action(UiActionType::CONFIGURE_WIFI);
             break;
@@ -818,7 +965,7 @@ UiAction UiManager::hitTestInternal(const UiViewModel &m, int x, int y) const {
             break;
         case AppState::MATTER_INIT_FAILED:
             if (UiRect{35, 405, 260, 70}.contains(x, y)) return action(UiActionType::RETRY);
-            if (UiRect{325, 405, 250, 70}.contains(x, y)) return action(UiActionType::MATTER_FORGET);
+            if (UiRect{325, 405, 250, 70}.contains(x, y)) return action(UiActionType::DIAGNOSTIC);
             if (UiRect{610, 405, 315, 70}.contains(x, y)) return action(UiActionType::BACK);
             break;
         case AppState::MATTER_SAVED_INVALID:

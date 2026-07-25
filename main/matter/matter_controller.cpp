@@ -5,16 +5,19 @@
 #include "esp_heap_caps.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 #include "system/control_heap.h"
 #include "system/control_time.h"
-#include "mdns.h"
+
+#include <cstdio>
 
 #if CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL
 #include <algorithm>
@@ -48,6 +51,7 @@
 #include <credentials/attestation_verifier/DeviceAttestationVerifier.h>
 #include <credentials/FabricTable.h>
 #include <lib/core/CHIPError.h>
+#include <platform/ESP32/ESP32Config.h>
 #include <platform/CHIPDeviceEvent.h>
 #include <setup_payload/SetupPayload.h>
 #endif
@@ -95,10 +99,10 @@ bool g_controllerInitialized = false;
 bool g_controllerInitInProgress = false;
 bool g_controllerInitFailed = false;
 esp_err_t g_controllerInitLastError = ESP_OK;
+bool g_matterStartInProgress = false;
 uint64_t g_pendingPreferredRemoteNodeId = 0;
 uint8_t g_pendingCommissioningMode = COMMISSIONING_MODE_FIRST_PAIRING;
 bool g_previousSendNocFabricConflict = false;
-bool g_lastMdnsPrescanFoundAny = false;
 std::string g_lastMdnsPrescanAddr;
 std::string g_lastMdnsPrescanHost;
 constexpr uint64_t CONTROL_CONTROLLER_FABRIC_ID = 1ULL;
@@ -214,6 +218,89 @@ void logInitLifecycle(const char *phase) {
 }
 
 #if CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL
+std::string ip4ToString(const esp_ip4_addr_t &addr) {
+    char buffer[16];
+    snprintf(buffer, sizeof(buffer), IPSTR, IP2STR(&addr));
+    return buffer;
+}
+
+std::string ip6ToString(const esp_ip6_addr_t &addr) {
+    char buffer[40];
+    snprintf(buffer, sizeof(buffer), IPV6STR, IPV62STR(addr));
+    return buffer;
+}
+
+bool wifiStaConnected() {
+    wifi_ap_record_t ap{};
+    return esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+}
+
+esp_err_t waitMatterNetworkPreflight(uint32_t timeoutMs) {
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_err_t lastErr = sta ? ESP_ERR_TIMEOUT : ESP_ERR_INVALID_STATE;
+    bool ip6CreateRequested = false;
+    const int64_t deadline = esp_timer_get_time() + static_cast<int64_t>(timeoutMs) * 1000;
+    while (esp_timer_get_time() < deadline) {
+        esp_netif_ip_info_t ip{};
+        const bool hasIpv4 = sta && esp_netif_get_ip_info(sta, &ip) == ESP_OK && ip.ip.addr != 0;
+        const bool connected = hasIpv4 && wifiStaConnected();
+        if (sta && hasIpv4 && !ip6CreateRequested) {
+            esp_ip6_addr_t tmp{};
+            if (esp_netif_get_ip6_linklocal(sta, &tmp) != ESP_OK) {
+                const esp_err_t ip6Err = esp_netif_create_ip6_linklocal(sta);
+                ESP_LOGI(TAG, "network_preflight_ipv6_linklocal_create result=%s", esp_err_to_name(ip6Err));
+            }
+            ip6CreateRequested = true;
+        }
+
+        esp_ip6_addr_t ip6{};
+        const bool hasIpv6LinkLocal =
+            sta && esp_netif_get_ip6_linklocal(sta, &ip6) == ESP_OK &&
+            esp_netif_ip6_get_addr_type(&ip6) == ESP_IP6_ADDR_IS_LINK_LOCAL;
+
+        if (connected && hasIpv4 && hasIpv6LinkLocal) {
+            ESP_LOGI(TAG, "network_ready_before_start ipv4=%s ipv6_ll=%s wifi_connected=yes",
+                     ip4ToString(ip.ip).c_str(), ip6ToString(ip6).c_str());
+            return ESP_OK;
+        }
+        lastErr = connected && hasIpv4 ? ESP_ERR_TIMEOUT : ESP_ERR_INVALID_STATE;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    esp_netif_ip_info_t ip{};
+    esp_ip6_addr_t ip6{};
+    const bool hasIpv4 = sta && esp_netif_get_ip_info(sta, &ip) == ESP_OK && ip.ip.addr != 0;
+    const bool hasIpv6LinkLocal =
+        sta && esp_netif_get_ip6_linklocal(sta, &ip6) == ESP_OK &&
+        esp_netif_ip6_get_addr_type(&ip6) == ESP_IP6_ADDR_IS_LINK_LOCAL;
+    ESP_LOGW(TAG, "network_ready_before_start ipv4=%s ipv6_ll=%s wifi_connected=%s result=%s",
+             hasIpv4 ? ip4ToString(ip.ip).c_str() : "none",
+             hasIpv6LinkLocal ? ip6ToString(ip6).c_str() : "none",
+             wifiStaConnected() ? "yes" : "no",
+             esp_err_to_name(lastErr));
+    return lastErr;
+}
+
+void logLwipMatterConfig() {
+    ESP_LOGI(TAG, "lwip_config max_sockets=%d max_udp_pcbs=%d udp_recvmbox=%d tcpip_recvmbox=%d tcp_recvmbox=%d netbuf_recvinfo=%s ipv6=%s ipv6_num_addresses=%d",
+             CONFIG_LWIP_MAX_SOCKETS,
+             CONFIG_LWIP_MAX_UDP_PCBS,
+             CONFIG_LWIP_UDP_RECVMBOX_SIZE,
+             CONFIG_LWIP_TCPIP_RECVMBOX_SIZE,
+             CONFIG_LWIP_TCP_RECVMBOX_SIZE,
+#if CONFIG_LWIP_NETBUF_RECVINFO
+             "yes",
+#else
+             "no",
+#endif
+#if CONFIG_LWIP_IPV6
+             "yes",
+#else
+             "no",
+#endif
+             CONFIG_LWIP_IPV6_NUM_ADDRESSES);
+}
+
 bool internalHeapLooksLow() {
     return heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 64 * 1024 ||
            heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) < MIN_CONTROLLER_LARGEST_INTERNAL_HEAP;
@@ -224,9 +311,57 @@ bool isValidRemoteNodeId(uint64_t nodeId) {
     return nodeId != 0 && nodeId != CONTROL_CONTROLLER_NODE_ID;
 }
 
+void formatMatterId(uint64_t id, char *buf, size_t size) {
+    if (!buf || size == 0) return;
+    snprintf(buf, size, "0x%08lx%08lx",
+             static_cast<unsigned long>(static_cast<uint32_t>(id >> 32)),
+             static_cast<unsigned long>(static_cast<uint32_t>(id & 0xffffffffULL)));
+}
+
 #if CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL
 bool controllerLargestInternalHeapReady() {
     return heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) >= MIN_CONTROLLER_LARGEST_INTERNAL_HEAP;
+}
+
+esp_err_t ensureChipUniqueIdProvisioned() {
+    using chip::DeviceLayer::Internal::ESP32Config;
+
+    char existing[64] = {0};
+    size_t existingLen = sizeof(existing);
+    CHIP_ERROR readErr = ESP32Config::ReadConfigValueStr(
+        ESP32Config::kConfigKey_UniqueId, existing, sizeof(existing), existingLen);
+    if (readErr == CHIP_NO_ERROR && existing[0] != '\0') {
+        ESP_LOGI(TAG, "chip_unique_id existing len=%u", static_cast<unsigned>(strlen(existing)));
+        return ESP_OK;
+    }
+    if (readErr != CHIP_NO_ERROR) {
+        ESP_LOGI(TAG, "chip_unique_id missing_or_unreadable chip_error=0x%lx",
+                 static_cast<unsigned long>(readErr.AsInteger()));
+    }
+
+    uint8_t mac[6] = {0};
+    const esp_err_t macErr = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    if (macErr != ESP_OK) {
+        ESP_LOGE(TAG, "chip_unique_id mac_read_failed err=%s", esp_err_to_name(macErr));
+        return macErr;
+    }
+
+    char uniqueId[33] = {0};
+    snprintf(uniqueId, sizeof(uniqueId),
+             "CTRL%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    const CHIP_ERROR writeErr = ESP32Config::WriteConfigValueStr(
+        ESP32Config::kConfigKey_UniqueId, uniqueId);
+    if (writeErr != CHIP_NO_ERROR) {
+        ESP_LOGE(TAG, "chip_unique_id write_failed chip_error=0x%lx",
+                 static_cast<unsigned long>(writeErr.AsInteger()));
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "chip_unique_id provisioned len=%u source=wifi_sta_mac",
+             static_cast<unsigned>(strlen(uniqueId)));
+    return ESP_OK;
 }
 
 bool logHeapOnInitFailure() {
@@ -364,9 +499,10 @@ void updateSavedNodeCache(MatterSavedState state, const MatterSavedNode &node, c
         ESP_LOGE(TAG, "save_matter_node_metadata refused reason=invalid_remote_node_id");
         return ESP_ERR_INVALID_ARG;
     }
-    ESP_LOGI(TAG, "save_matter_node_metadata start remote_node_id=0x%llx fabric_index=%u",
-             static_cast<unsigned long long>(node.node_id),
-             static_cast<unsigned>(node.fabric_index));
+    char nodeBuf[24];
+    formatMatterId(node.node_id, nodeBuf, sizeof(nodeBuf));
+    ESP_LOGI(TAG, "save_matter_node_metadata start remote_node_id=%s fabric_index=%u",
+             nodeBuf, static_cast<unsigned>(node.fabric_index));
     nvs_handle_t handle;
     esp_err_t err = nvs_open(MATTER_APP_NVS_NAMESPACE, NVS_READWRITE, &handle);
     bool opened = err == ESP_OK;
@@ -531,62 +667,6 @@ void logSetupPayloadDetails(const std::string &normalizedCode) {
              discoveryCapabilitiesText(payload));
 }
 
-std::string mdnsAddressString(const esp_ip_addr_t &addr) {
-    char text[IPADDR_STRLEN_MAX]{};
-    if (addr.type == ESP_IPADDR_TYPE_V4) {
-        ip4addr_ntoa_r(reinterpret_cast<const ip4_addr_t *>(&addr.u_addr.ip4), text, sizeof(text));
-    } else if (addr.type == ESP_IPADDR_TYPE_V6) {
-        ip6addr_ntoa_r(reinterpret_cast<const ip6_addr_t *>(&addr.u_addr.ip6), text, sizeof(text));
-    }
-    return text;
-}
-
-std::string mdnsTxtValue(mdns_result_t *item, const char *wanted) {
-    if (!item || !wanted) return {};
-    for (size_t i = 0; i < item->txt_count; ++i) {
-        const char *key = item->txt[i].key ? item->txt[i].key : "";
-        if (std::strcmp(key, wanted) == 0) {
-            return item->txt[i].value ? item->txt[i].value : "";
-        }
-    }
-    return {};
-}
-
-size_t prescanService(const char *service, const char *proto, uint32_t timeoutMs) {
-    mdns_result_t *results = nullptr;
-    const esp_err_t err = mdns_query_ptr(service, proto, timeoutMs, 8, &results);
-    size_t count = 0;
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "mdns_prescan service=%s.%s err=%s count=0", service, proto, esp_err_to_name(err));
-        return 0;
-    }
-    for (mdns_result_t *item = results; item != nullptr; item = item->next) {
-        ++count;
-        const std::string discriminator = mdnsTxtValue(item, "D");
-        for (mdns_ip_addr_t *addr = item->addr; addr != nullptr; addr = addr->next) {
-            const std::string addrText = mdnsAddressString(addr->addr);
-            if (g_lastMdnsPrescanAddr.empty() && !addrText.empty()) {
-                g_lastMdnsPrescanAddr = addrText;
-                g_lastMdnsPrescanHost = item->hostname ? item->hostname : "";
-            }
-            ESP_LOGI(TAG, "mdns_prescan_result host=%s addr=%s port=%u discriminator=%s",
-                     item->hostname ? item->hostname : "-",
-                     addrText.empty() ? "-" : addrText.c_str(),
-                     static_cast<unsigned>(item->port),
-                     discriminator.empty() ? "-" : discriminator.c_str());
-        }
-        if (!item->addr) {
-            ESP_LOGI(TAG, "mdns_prescan_result host=%s addr=- port=%u discriminator=%s",
-                     item->hostname ? item->hostname : "-",
-                     static_cast<unsigned>(item->port),
-                     discriminator.empty() ? "-" : discriminator.c_str());
-        }
-    }
-    ESP_LOGI(TAG, "mdns_prescan service=%s.%s count=%u", service, proto, static_cast<unsigned>(count));
-    if (results) mdns_query_results_free(results);
-    return count;
-}
-
 void readAttributeCallback(uint64_t remoteNodeId, const chip::app::ConcreteDataAttributePath &path,
                            chip::TLV::TLVReader *data) {
     ReadWaitContext *ctx = g_activeRead;
@@ -701,8 +781,10 @@ esp_err_t readMatterAttribute(ReadWaitContext &ctx, uint64_t nodeId, uint16_t en
         g_activeRead = nullptr;
         vSemaphoreDelete(ctx.done);
         ctx.done = nullptr;
-        ESP_LOGW(TAG, "read_timeout node_id=0x%llx endpoint=%u cluster=0x%lx attr=0x%lx",
-                 static_cast<unsigned long long>(nodeId), endpointId,
+        char nodeBuf[24];
+        formatMatterId(nodeId, nodeBuf, sizeof(nodeBuf));
+        ESP_LOGW(TAG, "read_timeout node_id=%s endpoint=%u cluster=0x%lx attr=0x%lx",
+                 nodeBuf, endpointId,
                  static_cast<unsigned long>(clusterId), static_cast<unsigned long>(attributeId));
         return ESP_ERR_TIMEOUT;
     }
@@ -1062,16 +1144,7 @@ void pase_callback(CHIP_ERROR err) {
     g_status = MatterCommissioningStatus::FAILED;
     g_lastResult.status = g_status;
     g_lastResult.error = ESP_FAIL;
-    if (err == CHIP_ERROR_TIMEOUT && g_lastMdnsPrescanFoundAny) {
-        g_lastResult.failure_stage = "pairing_code_discovery";
-        g_lastResult.failure_reason = "pairing_code_discovery_filter_mismatch_or_dns_sd_failure";
-        g_lastResult.errorText =
-            "Le code est valide, mais l'ESP32 ne voit pas le hub";
-        ESP_LOGW(TAG, "failure_reason=pairing_code_discovery_filter_mismatch_or_dns_sd_failure chip_error=%s",
-                 chip::ErrorStr(err));
-    } else {
-        g_lastResult.errorText = std::string("Échec PASE: ") + chip::ErrorStr(err);
-    }
+    g_lastResult.errorText = std::string("Échec PASE: ") + chip::ErrorStr(err);
     ESP_LOGW(TAG, "pase_session_failed err=%s", chip::ErrorStr(err));
 }
 
@@ -1079,17 +1152,23 @@ void commissioning_success_callback(chip::ScopedNodeId peerId) {
     const uint64_t callbackNodeId = peerId.GetNodeId();
     const uint64_t preferredNodeId = g_pendingPreferredRemoteNodeId;
     uint64_t remoteNodeId = isValidRemoteNodeId(callbackNodeId) ? callbackNodeId : 0;
+    char callbackNodeBuf[24];
+    char preferredNodeBuf[24];
+    char remoteNodeBuf[24];
+    formatMatterId(callbackNodeId, callbackNodeBuf, sizeof(callbackNodeBuf));
+    formatMatterId(preferredNodeId, preferredNodeBuf, sizeof(preferredNodeBuf));
+    bool usedPreferredNodeId = false;
     if (remoteNodeId == 0 && isValidRemoteNodeId(preferredNodeId)) {
         remoteNodeId = preferredNodeId;
-        ESP_LOGW(TAG, "commissioning_success using_preferred_node_id=0x%llx",
-                 static_cast<unsigned long long>(remoteNodeId));
+        usedPreferredNodeId = true;
     }
-    ESP_LOGI(TAG, "commissioning_success callback_node_id=0x%llx",
-             static_cast<unsigned long long>(callbackNodeId));
-    ESP_LOGI(TAG, "commissioning_success preferred_node_id=0x%llx",
-             static_cast<unsigned long long>(preferredNodeId));
-    ESP_LOGI(TAG, "commissioning_success selected_remote_node_id=0x%llx",
-             static_cast<unsigned long long>(remoteNodeId));
+    formatMatterId(remoteNodeId, remoteNodeBuf, sizeof(remoteNodeBuf));
+    if (usedPreferredNodeId) {
+        ESP_LOGW(TAG, "commissioning_success using_preferred_node_id=%s", remoteNodeBuf);
+    }
+    ESP_LOGI(TAG, "commissioning_success callback_node_id=%s", callbackNodeBuf);
+    ESP_LOGI(TAG, "commissioning_success preferred_node_id=%s", preferredNodeBuf);
+    ESP_LOGI(TAG, "commissioning_success selected_remote_node_id=%s", remoteNodeBuf);
 
     if (!isValidRemoteNodeId(remoteNodeId)) {
         g_status = MatterCommissioningStatus::FAILED;
@@ -1142,9 +1221,9 @@ void commissioning_success_callback(chip::ScopedNodeId peerId) {
     g_lastResult.nodeId = remoteNodeId;
     g_lastResult.fabricIndex = saved.fabric_index;
     g_postResult.savedNode = saved;
-    ESP_LOGI(TAG, "commissioning_success remote_node_id=0x%llx fabric_index=%u",
-             static_cast<unsigned long long>(g_lastResult.nodeId),
-             static_cast<unsigned>(g_lastResult.fabricIndex));
+    formatMatterId(g_lastResult.nodeId, remoteNodeBuf, sizeof(remoteNodeBuf));
+    ESP_LOGI(TAG, "commissioning_success remote_node_id=%s fabric_index=%u",
+             remoteNodeBuf, static_cast<unsigned>(g_lastResult.fabricIndex));
 }
 
 void commissioning_failure_callback(
@@ -1170,23 +1249,23 @@ void commissioning_failure_callback(
         additionalErrorInfo.has_value() && isPaaNotFoundOrUntrusted(additionalErrorInfo.value());
     const bool sendNocFailure = stage == chip::Controller::CommissioningStage::kSendNOC;
     const bool sendNocFabricConflict = isSendNocFabricConflict(stage, error);
+    char nodeBuf[24];
+    formatMatterId(g_lastResult.nodeId, nodeBuf, sizeof(nodeBuf));
     if (sendNocFabricConflict) {
         g_previousSendNocFabricConflict = true;
         g_lastResult.failure_reason = "send_noc_fabric_conflict";
         g_lastResult.errorText =
             "Matter déjà appairé ou fabric en conflit\n"
             "Oublier Matter côté IKEA puis réessayer";
-        ESP_LOGW(TAG, "failure_reason=send_noc_fabric_conflict chip_error=%s node_id=0x%llx fabric_index=%u noc_status=9",
-                 chip::ErrorStr(error),
-                 static_cast<unsigned long long>(g_lastResult.nodeId),
+        ESP_LOGW(TAG, "failure_reason=send_noc_fabric_conflict chip_error=%s node_id=%s fabric_index=%u noc_status=9",
+                 chip::ErrorStr(error), nodeBuf,
                  static_cast<unsigned>(g_lastResult.fabricIndex));
         dumpLocalStorageSummaryLocked();
     } else if (sendNocFailure) {
         g_lastResult.failure_reason = "send_noc_failed";
         g_lastResult.errorText = std::string("Échec SendNOC: ") + chip::ErrorStr(error);
-        ESP_LOGW(TAG, "send_noc_failed chip_error=%s node_id=0x%llx fabric_index=%u",
-                 chip::ErrorStr(error),
-                 static_cast<unsigned long long>(g_lastResult.nodeId),
+        ESP_LOGW(TAG, "send_noc_failed chip_error=%s node_id=%s fabric_index=%u",
+                 chip::ErrorStr(error), nodeBuf,
                  static_cast<unsigned>(g_lastResult.fabricIndex));
     } else if (attestationFailure
 #if CONFIG_CONTROL_MATTER_ALLOW_UNTRUSTED_ATTESTATION
@@ -1207,10 +1286,9 @@ void commissioning_failure_callback(
         g_lastResult.errorText = std::string("Échec commissioning: ") + chip::ErrorStr(error) +
                                  " étape " + chip::Controller::StageToString(stage);
     }
-    ESP_LOGW(TAG, "commissioning_failed err=%s stage=%s node_id=0x%llx fabric_index=%u",
+    ESP_LOGW(TAG, "commissioning_failed err=%s stage=%s node_id=%s fabric_index=%u",
              chip::ErrorStr(error), chip::Controller::StageToString(stage),
-             static_cast<unsigned long long>(g_lastResult.nodeId),
-             static_cast<unsigned>(g_lastResult.fabricIndex));
+             nodeBuf, static_cast<unsigned>(g_lastResult.fabricIndex));
     logChipStepResult("commissioning_failure", error);
 }
 
@@ -1242,14 +1320,18 @@ void dumpLocalStorageSummaryLocked() {
     }
 
     ESP_LOGI(TAG, "local_storage_summary fabric_exists=%s", fabricExists ? "yes" : "no");
-    ESP_LOGI(TAG, "local_storage_summary controller_node_id=0x%llx",
-             static_cast<unsigned long long>(controllerNodeId));
-    ESP_LOGI(TAG, "local_storage_summary fabric_id=0x%llx",
-             static_cast<unsigned long long>(fabricId));
-    ESP_LOGI(TAG, "local_storage_summary compressed_fabric_id=0x%llx",
-             static_cast<unsigned long long>(compressedFabricId));
-    ESP_LOGI(TAG, "local_storage_summary remote_node_id=0x%llx",
-             static_cast<unsigned long long>(g_savedNode.node_id));
+    char controllerNodeBuf[24];
+    char fabricBuf[24];
+    char compressedFabricBuf[24];
+    char remoteNodeBuf[24];
+    formatMatterId(controllerNodeId, controllerNodeBuf, sizeof(controllerNodeBuf));
+    formatMatterId(fabricId, fabricBuf, sizeof(fabricBuf));
+    formatMatterId(compressedFabricId, compressedFabricBuf, sizeof(compressedFabricBuf));
+    formatMatterId(g_savedNode.node_id, remoteNodeBuf, sizeof(remoteNodeBuf));
+    ESP_LOGI(TAG, "local_storage_summary controller_node_id=%s", controllerNodeBuf);
+    ESP_LOGI(TAG, "local_storage_summary fabric_id=%s", fabricBuf);
+    ESP_LOGI(TAG, "local_storage_summary compressed_fabric_id=%s", compressedFabricBuf);
+    ESP_LOGI(TAG, "local_storage_summary remote_node_id=%s", remoteNodeBuf);
 }
 #endif
 }
@@ -1300,8 +1382,9 @@ MatterSavedState matter_saved_state_load_and_validate(MatterSavedNode &out, std:
     if (raw.node.node_id == CONTROL_CONTROLLER_NODE_ID) {
         reason = "remote_node_id_is_controller";
         updateSavedNodeCache(MatterSavedState::Invalid, raw.node, reason);
-        ESP_LOGW(TAG, "saved_remote_node_id=0x%llx invalid=yes",
-                 static_cast<unsigned long long>(raw.node.node_id));
+        char nodeBuf[24];
+        formatMatterId(raw.node.node_id, nodeBuf, sizeof(nodeBuf));
+        ESP_LOGW(TAG, "saved_remote_node_id=%s invalid=yes", nodeBuf);
         ESP_LOGW(TAG, "saved_node_invalid reason=remote_node_id_is_controller");
         ESP_LOGW(TAG, "saved_state=invalid reason=%s", reason.c_str());
         return MatterSavedState::Invalid;
@@ -1309,10 +1392,11 @@ MatterSavedState matter_saved_state_load_and_validate(MatterSavedNode &out, std:
 
     out = raw.node;
     updateSavedNodeCache(MatterSavedState::Valid, raw.node, "");
-    ESP_LOGI(TAG, "saved_state=valid remote_node_id=0x%llx",
-             static_cast<unsigned long long>(raw.node.node_id));
-    ESP_LOGI(TAG, "saved_node found=yes node_id=0x%llx fabric_index=%u",
-             static_cast<unsigned long long>(raw.node.node_id), static_cast<unsigned>(raw.node.fabric_index));
+    char nodeBuf[24];
+    formatMatterId(raw.node.node_id, nodeBuf, sizeof(nodeBuf));
+    ESP_LOGI(TAG, "saved_state=valid remote_node_id=%s", nodeBuf);
+    ESP_LOGI(TAG, "saved_node found=yes node_id=%s fabric_index=%u",
+             nodeBuf, static_cast<unsigned>(raw.node.fabric_index));
     ESP_LOGI(TAG, "saved_node attestation_verified=%s attestation_bypassed=%s",
              raw.node.attestation_verified ? "yes" : "no",
              raw.node.attestation_bypassed ? "yes" : "no");
@@ -1366,6 +1450,15 @@ esp_err_t matter_controller_start_platform() {
 
 #if CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL
     control_heap_log("before_matter_platform_start");
+    ESP_LOGI(TAG, "start_guard active=%s already_started=%s failed_previous=%s",
+             g_matterStartInProgress ? "yes" : "no",
+             g_platformStarted ? "yes" : "no",
+             g_controllerInitFailed ? "yes" : "no");
+    if (g_matterStartInProgress) {
+        logEspStepResult("esp_matter_start", ESP_ERR_INVALID_STATE);
+        ESP_LOGW(TAG, "esp_matter_start_rejected reason=already_in_progress");
+        return ESP_ERR_INVALID_STATE;
+    }
     if (g_platformStarted) {
         logEspStepResult("esp_matter_start", ESP_OK);
         ESP_LOGI(TAG, "esp_matter_start_result=%s code=%d already_started=yes",
@@ -1398,6 +1491,29 @@ esp_err_t matter_controller_start_platform() {
         return err;
     }
 
+    err = ensureChipUniqueIdProvisioned();
+    if (err != ESP_OK) {
+        g_status = MatterCommissioningStatus::FAILED;
+        g_lastResult.status = g_status;
+        g_lastResult.error = err;
+        g_lastResult.errorText = std::string("Provisioning unique-id Matter échoué: ") + esp_err_to_name(err);
+        ESP_LOGE(TAG, "chip_unique_id provision_failed err=%s", esp_err_to_name(err));
+        setControllerState(MatterControllerState::FailedStorage);
+        return err;
+    }
+
+    logLwipMatterConfig();
+    err = waitMatterNetworkPreflight(10000);
+    if (err != ESP_OK) {
+        g_status = MatterCommissioningStatus::FAILED;
+        g_lastResult.status = g_status;
+        g_lastResult.error = err;
+        g_lastResult.errorText = "Wi-Fi/IPv6 non prêt pour Matter";
+        ESP_LOGE(TAG, "controller_init_failed reason=network_preflight err=%s", esp_err_to_name(err));
+        setControllerState(MatterControllerState::FailedUnknown);
+        return err;
+    }
+
     ESP_LOGI(TAG, "init_step=esp_matter_start");
     ESP_LOGI(TAG, "start_enter");
     ESP_LOGI(TAG, "heap_before_start internal=%u largest_internal=%u psram=%u largest_psram=%u",
@@ -1405,7 +1521,13 @@ esp_err_t matter_controller_start_platform() {
              static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
              static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+    ESP_LOGI("CONTROL_TASKS", "main_stack_high_water before_esp_matter_start=%u",
+             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+    g_matterStartInProgress = true;
     err = esp_matter::start(matter_app_event_cb);
+    g_matterStartInProgress = false;
+    ESP_LOGI("CONTROL_TASKS", "main_stack_high_water after_esp_matter_start=%u",
+             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
     logEspStepResult("esp_matter_start", err);
     ESP_LOGI(TAG, "esp_matter_start_result=%s code=%d", esp_err_to_name(err), static_cast<int>(err));
     if (err != ESP_OK) {
@@ -1482,6 +1604,7 @@ esp_err_t matter_controller_init_internal(bool early, bool requireSavedMetadata)
         control_heap_log("before_early_matter_init");
     }
     esp_err_t err = matter_controller_start_platform();
+    control_heap_log("after_matter_platform_start");
     if (err != ESP_OK) {
         g_controllerInitInProgress = false;
         g_controllerInitFailed = true;
@@ -1490,7 +1613,7 @@ esp_err_t matter_controller_init_internal(bool early, bool requireSavedMetadata)
         return err;
     }
     const char *failureStep = "controller_client_init";
-    const char *failureReason = "device_controller_factory";
+    const char *failureReason = "operational_keystore";
     const bool timeValid = control_time_has_valid_utc();
     ESP_LOGI(TAG, "time_valid_utc=%s before_controller_init", timeValid ? "yes" : "no");
     if (!timeValid) {
@@ -1510,7 +1633,7 @@ esp_err_t matter_controller_init_internal(bool early, bool requireSavedMetadata)
             g_lastResult.errorText = "Mémoire interne insuffisante pour Matter";
             ESP_LOGE(TAG, "controller_init_failed err=%s step=controller_client_init", esp_err_to_name(err));
             (void)logHeapOnInitFailure();
-            ESP_LOGE(TAG, "controller_init_failed reason=low_internal_heap_for_device_controller_factory");
+            ESP_LOGE(TAG, "controller_init_failed reason=operational_keystore_low_internal_heap");
             g_controllerInitInProgress = false;
             g_controllerInitFailed = true;
             g_controllerInitLastError = err;
@@ -1528,12 +1651,15 @@ esp_err_t matter_controller_init_internal(bool early, bool requireSavedMetadata)
         auto &client = esp_matter::controller::matter_controller_client::get_instance();
         if (!g_controllerClientInitialized) {
             ESP_LOGI(TAG, "init_step=controller_client_init early=%s", early ? "yes" : "no");
-            ESP_LOGI(TAG, "controller_init_args controller_node_id=0x%llx fabric_id=0x%llx listen_port=%u",
-                     static_cast<unsigned long long>(CONTROL_CONTROLLER_NODE_ID),
-                     static_cast<unsigned long long>(CONTROL_CONTROLLER_FABRIC_ID),
-                     static_cast<unsigned>(CONTROL_CONTROLLER_LISTEN_PORT));
-            ESP_LOGI(TAG, "saved_remote_node_id=0x%llx",
-                     static_cast<unsigned long long>(g_savedNode.node_id));
+            char controllerNodeBuf[24];
+            char fabricBuf[24];
+            char savedNodeBuf[24];
+            formatMatterId(CONTROL_CONTROLLER_NODE_ID, controllerNodeBuf, sizeof(controllerNodeBuf));
+            formatMatterId(CONTROL_CONTROLLER_FABRIC_ID, fabricBuf, sizeof(fabricBuf));
+            formatMatterId(g_savedNode.node_id, savedNodeBuf, sizeof(savedNodeBuf));
+            ESP_LOGI(TAG, "controller_init_args controller_node_id=%s fabric_id=%s listen_port=%u",
+                     controllerNodeBuf, fabricBuf, static_cast<unsigned>(CONTROL_CONTROLLER_LISTEN_PORT));
+            ESP_LOGI(TAG, "saved_remote_node_id=%s", savedNodeBuf);
             err = client.init(CONTROL_CONTROLLER_NODE_ID, CONTROL_CONTROLLER_FABRIC_ID,
                               CONTROL_CONTROLLER_LISTEN_PORT);
             control_heap_log("after_controller_client_init");
@@ -1552,9 +1678,12 @@ esp_err_t matter_controller_init_internal(bool early, bool requireSavedMetadata)
             failureReason = "setup_commissioner";
             ESP_LOGI(TAG, "init_step=setup_commissioner");
             ESP_LOGI(TAG, "credentials_issuer_init start issuer=ExampleOperationalCredentialsIssuer");
-            ESP_LOGI(TAG, "noc_chain_generation_start node_id=0x%llx fabric_id=0x%llx",
-                     static_cast<unsigned long long>(CONTROL_CONTROLLER_NODE_ID),
-                     static_cast<unsigned long long>(CONTROL_CONTROLLER_FABRIC_ID));
+            char controllerNodeBuf[24];
+            char fabricBuf[24];
+            formatMatterId(CONTROL_CONTROLLER_NODE_ID, controllerNodeBuf, sizeof(controllerNodeBuf));
+            formatMatterId(CONTROL_CONTROLLER_FABRIC_ID, fabricBuf, sizeof(fabricBuf));
+            ESP_LOGI(TAG, "noc_chain_generation_start node_id=%s fabric_id=%s",
+                     controllerNodeBuf, fabricBuf);
             err = client.setup_commissioner();
             logEspStepResult("setup_commissioner", err);
             ESP_LOGI(TAG, "setup_commissioner result=%s code=%d", esp_err_to_name(err), static_cast<int>(err));
@@ -1587,15 +1716,23 @@ esp_err_t matter_controller_init_internal(bool early, bool requireSavedMetadata)
         }
         const bool heapLow = logHeapOnInitFailure();
         if (!heapLow) {
-            ESP_LOGE(TAG, "controller_init_failed reason=%s err=%s", failureReason, esp_err_to_name(err));
-            setControllerState(MatterControllerState::FailedUnknown);
-        } else if (failureReason == std::string("device_controller_factory")) {
+            if (failureReason == std::string("operational_keystore")) {
+                ESP_LOGE(TAG, "controller_init_failed reason=operational_keystore_storage_error err=%s",
+                         esp_err_to_name(err));
+                g_lastResult.errorText = "Stockage opérationnel Matter indisponible";
+                setControllerState(MatterControllerState::FailedStorage);
+            } else {
+                ESP_LOGE(TAG, "controller_init_failed reason=%s err=%s", failureReason, esp_err_to_name(err));
+                setControllerState(MatterControllerState::FailedUnknown);
+            }
+        } else if (failureReason == std::string("operational_keystore")) {
             g_lastResult.errorText = "Mémoire interne insuffisante pour Matter";
-            ESP_LOGE(TAG, "controller_init_failed reason=low_internal_heap_for_device_controller_factory");
+            ESP_LOGE(TAG, "controller_init_failed reason=operational_keystore_low_internal_heap");
             setControllerState(MatterControllerState::FailedLowHeap);
         } else {
-            g_lastResult.errorText = "Mémoire interne insuffisante pour Matter";
-            setControllerState(MatterControllerState::FailedLowHeap);
+            ESP_LOGE(TAG, "controller_init_failed reason=operational_keystore_storage_error");
+            g_lastResult.errorText = "Stockage opérationnel Matter indisponible";
+            setControllerState(MatterControllerState::FailedStorage);
         }
         g_controllerInitInProgress = false;
         g_controllerInitFailed = true;
@@ -1659,12 +1796,6 @@ esp_err_t matter_controller_early_init() {
         ESP_LOGW(TAG, "early_init_skipped reason=wifi_not_connected");
         return ESP_ERR_INVALID_STATE;
     }
-    if (g_controllerInitFailed) {
-        ESP_LOGI(TAG, "early_init_retry_after_previous_failure err=%s",
-                 esp_err_to_name(g_controllerInitLastError == ESP_OK ? ESP_FAIL : g_controllerInitLastError));
-        g_controllerInitFailed = false;
-        g_controllerInitLastError = ESP_OK;
-    }
     return matter_controller_init_internal(true, false);
 #else
     return matter_controller_init();
@@ -1720,9 +1851,10 @@ esp_err_t matter_controller_validate_saved_node_fabric() {
         ESP_LOGW(TAG, "fabric_storage_check result=invalid");
         return ESP_ERR_INVALID_STATE;
     }
-    ESP_LOGI(TAG, "saved_node metadata found=yes node_id=0x%llx",
-             static_cast<unsigned long long>(node.node_id));
-    ESP_LOGI(TAG, "saved_remote_node_id=0x%llx", static_cast<unsigned long long>(node.node_id));
+    char nodeBuf[24];
+    formatMatterId(node.node_id, nodeBuf, sizeof(nodeBuf));
+    ESP_LOGI(TAG, "saved_node metadata found=yes node_id=%s", nodeBuf);
+    ESP_LOGI(TAG, "saved_remote_node_id=%s", nodeBuf);
 #if CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL
     esp_err_t err = matter_controller_early_init();
     if (err != ESP_OK) {
@@ -1743,8 +1875,9 @@ esp_err_t matter_controller_validate_saved_node_fabric() {
     ESP_LOGI(TAG, "fabric_count=%u", static_cast<unsigned>(fabricCount));
     ESP_LOGI(TAG, "fabric_index=%u", static_cast<unsigned>(fabricIndex));
     if (fabric) {
-        ESP_LOGI(TAG, "restored_fabric_node_id=0x%llx",
-                 static_cast<unsigned long long>(fabric->GetNodeId()));
+        char restoredNodeBuf[24];
+        formatMatterId(fabric->GetNodeId(), restoredNodeBuf, sizeof(restoredNodeBuf));
+        ESP_LOGI(TAG, "restored_fabric_node_id=%s", restoredNodeBuf);
     } else {
         ESP_LOGW(TAG, "restored_fabric_node_id unavailable");
     }
@@ -1769,13 +1902,15 @@ void matter_controller_dump_local_storage_summary() {
     dumpLocalStorageSummaryLocked();
 #else
     ensureSavedNodeLoaded();
+    char controllerNodeBuf[24];
+    char remoteNodeBuf[24];
+    formatMatterId(CONTROL_CONTROLLER_NODE_ID, controllerNodeBuf, sizeof(controllerNodeBuf));
+    formatMatterId(g_savedNode.node_id, remoteNodeBuf, sizeof(remoteNodeBuf));
     ESP_LOGI(TAG, "local_storage_summary fabric_exists=no");
-    ESP_LOGI(TAG, "local_storage_summary controller_node_id=0x%llx",
-             static_cast<unsigned long long>(CONTROL_CONTROLLER_NODE_ID));
+    ESP_LOGI(TAG, "local_storage_summary controller_node_id=%s", controllerNodeBuf);
     ESP_LOGI(TAG, "local_storage_summary fabric_id=0x0");
     ESP_LOGI(TAG, "local_storage_summary compressed_fabric_id=0x0");
-    ESP_LOGI(TAG, "local_storage_summary remote_node_id=0x%llx",
-             static_cast<unsigned long long>(g_savedNode.node_id));
+    ESP_LOGI(TAG, "local_storage_summary remote_node_id=%s", remoteNodeBuf);
 #endif
 }
 
@@ -1784,14 +1919,16 @@ uint64_t matter_controller_get_preferred_remote_node_id() {
     const uint64_t nodeId = g_previousSendNocFabricConflict
         ? CONTROL_FABRIC_CONFLICT_REMOTE_NODE_ID
         : CONTROL_PRIMARY_REMOTE_NODE_ID;
-    ESP_LOGI(TAG, "preferred_remote_node_id=0x%llx",
-             static_cast<unsigned long long>(nodeId));
+    char nodeBuf[24];
+    formatMatterId(nodeId, nodeBuf, sizeof(nodeBuf));
+    ESP_LOGI(TAG, "preferred_remote_node_id=%s", nodeBuf);
     ESP_LOGI(TAG, "previous_send_noc_fabric_conflict=%s",
              g_previousSendNocFabricConflict ? "yes" : "no");
     return nodeId;
 #else
-    ESP_LOGI(TAG, "preferred_remote_node_id=0x%llx",
-             static_cast<unsigned long long>(CONTROL_PRIMARY_REMOTE_NODE_ID));
+    char nodeBuf[24];
+    formatMatterId(CONTROL_PRIMARY_REMOTE_NODE_ID, nodeBuf, sizeof(nodeBuf));
+    ESP_LOGI(TAG, "preferred_remote_node_id=%s", nodeBuf);
     ESP_LOGI(TAG, "previous_send_noc_fabric_conflict=no");
     return CONTROL_PRIMARY_REMOTE_NODE_ID;
 #endif
@@ -1802,32 +1939,6 @@ void matter_controller_set_pending_commissioning_mode(bool multi_admin) {
     g_pendingCommissioningMode = multi_admin ? COMMISSIONING_MODE_MULTI_ADMIN : COMMISSIONING_MODE_FIRST_PAIRING;
 #endif
     ESP_LOGI(TAG, "commissioning_mode_pending=%s", multi_admin ? "multi_admin" : "first_pairing");
-}
-
-esp_err_t matter_controller_mdns_prescan(bool &foundAny, uint32_t timeoutMs) {
-    foundAny = false;
-#if CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL
-    ESP_LOGI(TAG, "mdns_prescan_start");
-    g_lastMdnsPrescanAddr.clear();
-    g_lastMdnsPrescanHost.clear();
-    esp_err_t initErr = mdns_init();
-    if (initErr != ESP_OK && initErr != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "mdns_prescan_init_failed err=%s", esp_err_to_name(initErr));
-        g_lastMdnsPrescanFoundAny = false;
-        return initErr;
-    }
-    const size_t matterc = prescanService("_matterc", "_udp", timeoutMs);
-    const size_t matterd = prescanService("_matterd", "_udp", timeoutMs);
-    foundAny = (matterc + matterd) > 0;
-    g_lastMdnsPrescanFoundAny = foundAny;
-    ESP_LOGI(TAG, "mdns_prescan_done found=%s total=%u",
-             foundAny ? "yes" : "no", static_cast<unsigned>(matterc + matterd));
-    return ESP_OK;
-#else
-    ESP_LOGI(TAG, "mdns_prescan_start");
-    ESP_LOGW(TAG, "mdns_prescan unavailable reason=matter_commissioning_disabled");
-    return ESP_ERR_NOT_SUPPORTED;
-#endif
 }
 
 esp_err_t clearNvsNamespace(const char *ns) {
@@ -1957,10 +2068,10 @@ void matterDiscoveryWorker(void *) {
         return;
     }
 
-    ESP_LOGI(TAG, "use_saved_node remote_node_id=0x%llx",
-             static_cast<unsigned long long>(savedNode.node_id));
-    ESP_LOGI(TAG, "discovery_refresh_start node_id=0x%llx",
-             static_cast<unsigned long long>(savedNode.node_id));
+    char savedNodeBuf[24];
+    formatMatterId(savedNode.node_id, savedNodeBuf, sizeof(savedNodeBuf));
+    ESP_LOGI(TAG, "use_saved_node remote_node_id=%s", savedNodeBuf);
+    ESP_LOGI(TAG, "discovery_refresh_start node_id=%s", savedNodeBuf);
 
     ESP_LOGI(TAG, "controller_ready=%s", matter_controller_is_ready() ? "yes" : "no");
     esp_err_t err = matter_controller_is_ready() ? ESP_OK : matter_controller_early_init();
@@ -2097,9 +2208,11 @@ void matterCommandWorker(void *arg) {
     const uint32_t commandId = args->on
         ? chip::app::Clusters::OnOff::Commands::On::Id
         : chip::app::Clusters::OnOff::Commands::Off::Id;
-    ESP_LOGI(TAG, "%s node_id=0x%llx endpoint=%u",
+    char nodeBuf[24];
+    formatMatterId(args->node_id, nodeBuf, sizeof(nodeBuf));
+    ESP_LOGI(TAG, "%s node_id=%s endpoint=%u",
              args->on ? "command_on" : "command_off",
-             static_cast<unsigned long long>(args->node_id), args->endpoint_id);
+             nodeBuf, args->endpoint_id);
     g_postResult.status = MatterPostCommissioningStatus::COMMAND_IN_PROGRESS;
     g_postResult.activeEndpoint = args->endpoint_id;
     esp_err_t err = matter_controller_is_ready() ? ESP_OK : matter_controller_early_init();
@@ -2139,9 +2252,10 @@ void matterCommandWorker(void *arg) {
 esp_err_t matter_controller_commission_with_manual_code(
     const std::string &normalizedCode,
     uint64_t preferredNodeId) {
-    ESP_LOGI(TAG, "commissioning_start code_len=%u node_id=0x%llx",
-             static_cast<unsigned>(normalizedCode.size()),
-             static_cast<unsigned long long>(preferredNodeId));
+    char preferredNodeBuf[24];
+    formatMatterId(preferredNodeId, preferredNodeBuf, sizeof(preferredNodeBuf));
+    ESP_LOGI(TAG, "commissioning_start code_len=%u node_id=%s",
+             static_cast<unsigned>(normalizedCode.size()), preferredNodeBuf);
 
 #if CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL
     g_pendingPreferredRemoteNodeId = preferredNodeId;
@@ -2171,8 +2285,8 @@ esp_err_t matter_controller_commission_with_manual_code(
     g_attestationBypassObserved = false;
 
     ESP_LOGI(TAG, "pairing_code_start");
-    ESP_LOGI(TAG, "init_step=pairing_code enter node_id=0x%llx code_len=%u",
-             static_cast<unsigned long long>(preferredNodeId),
+    ESP_LOGI(TAG, "init_step=pairing_code enter node_id=%s code_len=%u",
+             preferredNodeBuf,
              static_cast<unsigned>(normalizedCode.size()));
     esp_err_t err = ESP_OK;
     {
@@ -2192,8 +2306,8 @@ esp_err_t matter_controller_commission_with_manual_code(
         ESP_LOGE(TAG, "commissioning_start_failed err=%s", esp_err_to_name(err));
         return err;
     }
-    ESP_LOGI(TAG, "commissioning_async_started node_id=0x%llx method=pairing_code_on_network",
-             static_cast<unsigned long long>(preferredNodeId));
+    ESP_LOGI(TAG, "commissioning_async_started node_id=%s method=pairing_code_on_network",
+             preferredNodeBuf);
     return ESP_OK;
 #else
     g_status = MatterCommissioningStatus::NOT_SUPPORTED;

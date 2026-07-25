@@ -1,4 +1,5 @@
 set(CONTROL_MAIN_EXPERIMENTAL_MATTER OFF)
+set(CONTROL_MAIN_RECOVERY OFF)
 set(CONTROL_MAIN_CONFIG_FILES)
 if(DEFINED SDKCONFIG)
     list(APPEND CONTROL_MAIN_CONFIG_FILES "${SDKCONFIG}")
@@ -25,6 +26,15 @@ foreach(CONFIG_FILE ${CONTROL_MAIN_CONFIG_FILES})
         if(CONTROL_MAIN_CONFIG_CONTENT MATCHES "(^|\n)# CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL is not set(\n|$)")
             set(CONTROL_MAIN_EXPERIMENTAL_MATTER OFF)
         endif()
+        if(CONTROL_MAIN_CONFIG_CONTENT MATCHES "(^|\n)CONFIG_CONTROL_RECOVERY_BUILD=y(\n|$)")
+            set(CONTROL_MAIN_RECOVERY ON)
+        endif()
+        if(CONTROL_MAIN_CONFIG_CONTENT MATCHES "(^|\n)# CONFIG_CONTROL_RECOVERY_BUILD is not set(\n|$)")
+            set(CONTROL_MAIN_RECOVERY OFF)
+        endif()
+        if(CONTROL_MAIN_CONFIG_CONTENT MATCHES "(^|\n)CONFIG_CONTROL_RECOVERY_BUILD=n(\n|$)")
+            set(CONTROL_MAIN_RECOVERY OFF)
+        endif()
     endif()
 endforeach()
 
@@ -35,9 +45,10 @@ set(CONTROL_MAIN_REQUIRES
     esp_app_format
     esp_netif
     esp_timer
+    esp_http_client
+    json
     esp_wifi
     lwip
-    mdns
     esp_driver_i2c
     nvs_flash
     app_update)
@@ -58,6 +69,10 @@ if(CONTROL_MAIN_EXPERIMENTAL_MATTER)
     set(CONTROL_MAIN_LDFRAGMENTS "linker.lf")
 endif()
 
+if(NOT CONTROL_MAIN_RECOVERY)
+    list(APPEND CONTROL_MAIN_REQUIRES mdns)
+endif()
+
 idf_component_register(
     SRCS
         "main.cpp"
@@ -67,6 +82,7 @@ idf_component_register(
         "wifi/wifi_manager.cpp"
         "system/control_heap.cpp"
         "system/control_time.cpp"
+        "weather/weather_manager.cpp"
         "ikea/ikea_discovery.cpp"
         "matter/matter_controller.cpp"
         "matter/matter_pairing_code.cpp"
@@ -76,6 +92,10 @@ idf_component_register(
     PRIV_INCLUDE_DIRS ${CONTROL_MAIN_PRIV_INCLUDE_DIRS}
     REQUIRES ${CONTROL_MAIN_REQUIRES}
     LDFRAGMENTS ${CONTROL_MAIN_LDFRAGMENTS})
+
+if(NOT CONTROL_MAIN_RECOVERY)
+    target_sources(${COMPONENT_LIB} PRIVATE "network/mdns_manager.cpp")
+endif()
 
 if(CONTROL_MAIN_EXPERIMENTAL_MATTER)
     if(NOT DEFINED ENV{ESP_MATTER_PATH})

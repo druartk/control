@@ -1,7 +1,10 @@
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstdint>
 #include <string>
+#include <cstring>
+#include <cctype>
 #include "app_state.h"
 #include "board/board_config.h"
 #include "display/display_manager.h"
@@ -22,6 +25,8 @@
 #include "touch/touch_manager.h"
 #include "ui/ui_manager.h"
 #include "wifi/wifi_manager.h"
+#include "weather/weather_manager.h"
+#include "sdkconfig.h"
 
 #ifndef CONFIG_CONTROL_PASSWORD_PARTIALS_BEFORE_FULL_REFRESH
 #define CONFIG_CONTROL_PASSWORD_PARTIALS_BEFORE_FULL_REFRESH 20
@@ -55,6 +60,15 @@ const char *wifiAuthName(wifi_auth_mode_t auth) {
     }
 }
 
+#if !CONFIG_CONTROL_RECOVERY_BUILD
+void formatMatterNodeId(uint64_t nodeId, char *buf, size_t size) {
+    if (!buf || size == 0) return;
+    snprintf(buf, size, "0x%08lx%08lx",
+             static_cast<unsigned long>(static_cast<uint32_t>(nodeId >> 32)),
+             static_cast<unsigned long>(static_cast<uint32_t>(nodeId & 0xffffffffULL)));
+}
+#endif
+
 const char *keyboardModeName(int mode) {
     switch (mode) {
         case 1: return "upper";
@@ -82,6 +96,11 @@ public:
     bool initialize() {
         ESP_LOGI(TAG, "Control %s — build %s %s — ESP-IDF %s", CONTROL_FW_VERSION,
                  __DATE__, __TIME__, esp_get_idf_version());
+#if CONFIG_CONTROL_RECOVERY_BUILD
+        ESP_LOGI(TAG, "recovery_build=yes");
+#else
+        ESP_LOGI(TAG, "recovery_build=no");
+#endif
         ESP_LOGI(TAG, "Carte cible: %s %s — PCB %s — révision physique confirmée",
                  CONTROL_BOARD_NAME, CONTROL_BOARD_REVISION, CONTROL_BOARD_PCB_DATE);
         ESP_LOGI(TAG, "Module attendu: %s, flash 16 Mio QIO, PSRAM 8 Mio OPI",
@@ -89,16 +108,22 @@ public:
         ESP_LOGI(TAG, "CONFIG_ESP_MAIN_TASK_STACK_SIZE=%d bytes", CONFIG_ESP_MAIN_TASK_STACK_SIZE);
         control_heap_log("boot_start");
         transitionState(AppState::BOOT);
-        storage_.initialize();
+        ESP_LOGI(TAG, "boot_phase=nvs");
+        if (!storage_.initialize()) {
+            ESP_LOGE(TAG, "recovery_boot_stopped reason=nvs_init_failed");
+            return false;
+        }
+        control_heap_log("after_nvs");
         const StoredSettings saved = storage_.load();
         savedSsid_ = saved.ssid;
         savedPassword_ = saved.password;
+        control_heap_log("after_minimal_wifi_credentials_load");
         ESP_LOGI("CONTROL_WIFI", "load_wifi_credentials found=%s",
                  saved.hasWifiCredentials() ? "yes" : "no");
         selectedSsid_ = savedSsid_;
         password_ = savedPassword_;
+        ESP_LOGI(TAG, "boot_phase=wifi_init");
         const bool wifiOk = wifi_.initialize();
-        control_heap_log("after_wifi_init");
         ESP_LOGI("CONTROL_HEAP", "task_stack_config name=matter_worker size=%u priority=%u",
                  static_cast<unsigned>(MATTER_COMMISSIONING_WORKER_STACK_SIZE),
                  static_cast<unsigned>(MATTER_COMMISSIONING_WORKER_PRIORITY));
@@ -110,34 +135,91 @@ public:
                  static_cast<unsigned>(UI_TASK_PRIORITY));
         ESP_LOGI("CONTROL_HEAP", "task_stack_config name=touch size=%d priority=%u",
                  CONFIG_CONTROL_TOUCH_TASK_STACK_SIZE, static_cast<unsigned>(TOUCH_TASK_PRIORITY));
-        if (wifiOk && !savedSsid_.empty()) {
-            connectSavedWifiHeadless();
-            if (wifi_.isConnected()) {
-                (void)runEarlyMatterInit("boot_saved_wifi", false);
+
+#if CONFIG_CONTROL_RECOVERY_BUILD
+        ESP_LOGI(TAG, "recovery_matter=disabled");
+        ESP_LOGI(TAG, "recovery_wifi_connect=deferred_until_ui");
+        ESP_LOGI(TAG, "boot_headless_result wifi=deferred matter=disabled");
+#else
+        loadSavedMatterNode();
+        const bool savedWifiBootPath = wifiOk && !savedSsid_.empty();
+        const bool matterPlatformBootPath = savedWifiBootPath;
+        esp_err_t wifiHeadlessErr = savedWifiBootPath ? ESP_ERR_TIMEOUT : ESP_ERR_INVALID_STATE;
+        bool matterBootReady = false;
+        const char *wifiHeadlessResult = savedWifiBootPath ? "timeout" : "skipped";
+        const char *matterHeadlessResult = matterPlatformBootPath ? "pending" : "skipped";
+        if (savedWifiBootPath) {
+            ESP_LOGI(TAG, "boot_phase=wifi_connect");
+            control_heap_log("before_wifi_start");
+            wifiHeadlessErr = connectSavedWifiHeadless();
+            if (wifiHeadlessErr == ESP_OK) {
+                wifiHeadlessResult = "connected";
+                control_heap_log("after_wifi_got_ip");
+                if (matterPlatformBootPath) {
+                    ESP_LOGI(TAG, "boot_phase=matter_early_init");
+                    esp_err_t networkReady = wifi_.waitMatterNetworkReady(MATTER_NETWORK_READY_TIMEOUT_MS);
+                    if (networkReady != ESP_OK) {
+                        ESP_LOGW("CONTROL_MATTER", "early_init_network_failed err=%s", esp_err_to_name(networkReady));
+                        matterHeadlessResult = "network_not_ready";
+                    } else {
+                        control_heap_log("before_sntp");
+                        (void)control_time_start_sntp_once();
+                        (void)control_time_wait_synced(MATTER_SNTP_READY_TIMEOUT_MS);
+                        control_heap_log("before_matter_platform_start");
+                        ESP_LOGI("CONTROL_MATTER", "early_init_start");
+                        matterBootReady = runEarlyMatterInit("boot_saved_wifi", false);
+                        matterHeadlessResult = matterBootReady ? "ready" : "failed";
+                    }
+                }
+            } else {
+                wifiHeadlessResult = wifiHeadlessErr == ESP_ERR_TIMEOUT ? "timeout" : "failed";
+                ESP_LOGI("CONTROL_MATTER", "early_init_skipped reason=wifi_not_connected");
             }
+            if (matterPlatformBootPath && !matterBootReady) matterEarlyInitFailed_ = true;
         } else if (savedSsid_.empty()) {
             ESP_LOGI("CONTROL_MATTER", "early_init_skipped reason=no_wifi_credentials");
+        } else {
+            ESP_LOGI("CONTROL_MATTER", "early_init_skipped reason=wifi_init_failed");
         }
+        ESP_LOGI(TAG, "boot_headless_result wifi=%s matter=%s", wifiHeadlessResult, matterHeadlessResult);
+#endif
+
+#if CONFIG_CONTROL_RECOVERY_BUILD
+        ESP_LOGI(TAG, "weather_init deferred reason=recovery_wifi");
+#else
+        control_heap_log("before_weather_init");
+        (void)weather_init();
+        (void)weather_load_cache();
+        weather_ensure_placeholder();
+        control_heap_log("after_weather_init");
+#endif
+        ESP_LOGI(TAG, "boot_phase=ui_init");
+        control_heap_log("before_ui_init");
         const bool displayOk = display_.initialize();
         control_heap_log("after_display_init");
         const bool touchOk = touch_.initialize();
         control_heap_log("after_touch_init");
         control_heap_log("after_ui_init");
+#if !CONFIG_CONTROL_RECOVERY_BUILD
         matter_.initializeControllerPlaceholder();
         matter_controller_log_boot_status();
-        loadSavedMatterNode();
+#endif
 
         ESP_LOGI(TAG, "Diagnostic: écran=%s tactile=%s Wi-Fi=%s NVS=%s firmware=%s",
                  displayOk ? "OK" : display_.statusText(), touchOk ? "OK" : touch_.statusText(),
                  wifiOk ? "OK" : wifi_.statusText(), storage_.statusText(), CONTROL_FW_VERSION);
-        if (wifi_.isConnected() && matterSavedState_ == MatterSavedState::Valid) {
+#if CONFIG_CONTROL_RECOVERY_BUILD
+        state_ = !savedSsid_.empty() ? AppState::WEATHER_HOME : AppState::HARDWARE_TEST;
+#else
+        if (matterBootReady && matter_controller_is_ready()) {
             MatterPostCommissioningResult cached;
             (void)matter_controller_load_device_cache(cached);
             matterPostResult_ = cached;
-            state_ = AppState::MATTER_INTRO;
+            state_ = AppState::WEATHER_HOME;
         } else {
-            state_ = wifi_.isConnected() ? AppState::WIFI_CONNECTED : AppState::HARDWARE_TEST;
+            state_ = !savedSsid_.empty() ? AppState::WEATHER_HOME : AppState::HARDWARE_TEST;
         }
+#endif
         (void)saved;
         touchQueue_ = xQueueCreate(TOUCH_QUEUE_LENGTH, sizeof(TouchEvent));
         if (touchQueue_ == nullptr) {
@@ -152,7 +234,10 @@ public:
     }
 
     void renderInitialScreen() {
-        if (state_ == AppState::WIFI_CONNECTED || state_ == AppState::MATTER_INTRO) {
+        if (state_ == AppState::WEATHER_HOME || state_ == AppState::WIFI_CONNECTED || state_ == AppState::MATTER_INTRO) {
+            ESP_LOGI(TAG, "boot_phase=weather_home_render");
+            ESP_LOGI(TAG, "boot_screen=WEATHER_HOME");
+            ESP_LOGI("CONTROL_DISPLAY", "render_start state=WEATHER_HOME");
             renderUi("screen_enter");
         } else {
             renderHardwareTest();
@@ -167,9 +252,13 @@ public:
     void runRecoveryIdleLoop() {
         while (true) {
             processWifi();
+#if !CONFIG_CONTROL_RECOVERY_BUILD
             processIkea();
             processMatter();
+#endif
+            processWeather();
             processTimeouts();
+            processPendingRender();
             processTouchEvents();
             vTaskDelay(pdMS_TO_TICKS(20));
         }
@@ -258,6 +347,15 @@ private:
         m.matterPost = matterPostResult_;
         m.matterDevicePage = matterDevicePage_;
         m.selectedMatterDevice = selectedMatterDevice_;
+        m.weatherCurrent = weather_get_current();
+        size_t weatherCount = 0;
+        const WeatherForecastDay *weatherDays = weather_get_forecast(&weatherCount);
+        if (weatherDays) m.weatherForecast.assign(weatherDays, weatherDays + weatherCount);
+        m.weatherRefreshing = weather_refresh_in_progress();
+        m.wifiConfigured = !savedSsid_.empty();
+        m.matterEarlyInitFailed = matterEarlyInitFailed_;
+        m.rooms = rooms_;
+        m.selectedRoom = selectedRoom_;
         return m;
     }
 
@@ -280,13 +378,33 @@ private:
         }
         ESP_LOGI("CONTROL_UI", "render reason=%s state=%s",
                  reason ? reason : "unspecified", appStateName(state_));
-        return ui_.render(viewModel());
+        const bool ok = ui_.render(viewModel());
+        if (!ok && display_.busy()) {
+            pendingRender_ = true;
+            pendingRenderState_ = state_;
+            pendingRenderReason_ = reason ? reason : "unspecified";
+            ESP_LOGI("CONTROL_UI", "render_deferred reason=display_busy state=%s",
+                     appStateName(state_));
+        } else if (ok) {
+            pendingRender_ = false;
+        }
+        return ok;
     }
 
     bool renderUiEvenIfMatterQuiet(const char *reason) {
         ESP_LOGI("CONTROL_UI", "render reason=%s state=%s quiet_override=yes",
                  reason ? reason : "unspecified", appStateName(state_));
-        return ui_.render(viewModel());
+        const bool ok = ui_.render(viewModel());
+        if (!ok && display_.busy()) {
+            pendingRender_ = true;
+            pendingRenderState_ = state_;
+            pendingRenderReason_ = reason ? reason : "unspecified";
+            ESP_LOGI("CONTROL_UI", "render_deferred reason=display_busy state=%s",
+                     appStateName(state_));
+        } else if (ok) {
+            pendingRender_ = false;
+        }
+        return ok;
     }
 
     void logTaskRuntimeDiagnostics(const char *phase) {
@@ -318,39 +436,38 @@ private:
                  static_cast<unsigned>(uxTaskGetStackHighWaterMark(handle)));
     }
 
-    bool connectSavedWifiHeadless() {
+    esp_err_t connectSavedWifiHeadless() {
         if (savedSsid_.empty()) {
             ESP_LOGI("CONTROL_WIFI", "headless_connect_skipped reason=no_saved_credentials");
-            return false;
+            return ESP_ERR_INVALID_STATE;
         }
         ESP_LOGI("CONTROL_WIFI", "auto_connect start ssid=\"%s\"", savedSsid_.c_str());
         ESP_LOGI("CONTROL_WIFI", "headless_connect_start ssid=\"%s\"", savedSsid_.c_str());
         connectionStartedUs_ = esp_timer_get_time();
         if (!wifi_.connect(savedSsid_, savedPassword_)) {
             ESP_LOGW("CONTROL_WIFI", "headless_connect_start_failed");
-            return false;
+            return ESP_FAIL;
         }
-        const int64_t deadline = esp_timer_get_time() + 15000LL * 1000;
-        while (esp_timer_get_time() < deadline) {
-            const WifiStatusEvent event = wifi_.poll();
-            if (event.type == WifiEventType::CONNECTED) {
-                ESP_LOGI("CONTROL_WIFI", "headless_connect_result=connected");
-                wifi_.releaseTransientBuffers();
-                return true;
-            }
-            if (event.type == WifiEventType::FAILED) {
-                ESP_LOGW("CONTROL_WIFI", "headless_connect_result=failed reason=%s", event.reason.c_str());
-                return false;
-            }
-            vTaskDelay(pdMS_TO_TICKS(50));
+        ESP_LOGI(TAG, "boot_phase=wifi_wait");
+        const esp_err_t err = wifi_.waitGotIp(15000);
+        if (err == ESP_OK) {
+            ESP_LOGI("CONTROL_WIFI", "headless_connect_result=connected");
+            wifi_.releaseTransientBuffers();
+        } else if (err == ESP_ERR_TIMEOUT) {
+            ESP_LOGW("CONTROL_WIFI", "headless_connect_result=timeout");
+            wifi_.cancel();
+        } else {
+            ESP_LOGW("CONTROL_WIFI", "headless_connect_result=failed err=%s", esp_err_to_name(err));
         }
-        ESP_LOGW("CONTROL_WIFI", "headless_connect_result=timeout");
-        wifi_.cancel();
-        return false;
+        return err;
     }
 
     bool runEarlyMatterInit(const char *reason, bool showFailure) {
-#if CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL
+#if CONFIG_CONTROL_RECOVERY_BUILD
+        (void)reason;
+        (void)showFailure;
+        return false;
+#elif CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL
         if (matter_controller_is_ready()) {
             ESP_LOGI("CONTROL_MATTER", "early_init_skipped reason=already_ready request=%s",
                      reason ? reason : "-");
@@ -370,6 +487,19 @@ private:
         }
         ESP_LOGI("CONTROL_MATTER", "early_init_request reason=%s", reason ? reason : "-");
         wifi_.releaseTransientBuffers();
+        const esp_err_t networkReady = wifi_.waitMatterNetworkReady(MATTER_NETWORK_READY_TIMEOUT_MS);
+        if (networkReady != ESP_OK) {
+            ESP_LOGW("CONTROL_MATTER", "early_init_skipped reason=network_not_ready err=%s request=%s",
+                     esp_err_to_name(networkReady), reason ? reason : "-");
+            if (showFailure) {
+                matterPostResult_ = {};
+                matterPostResult_.status = MatterPostCommissioningStatus::CONNECTION_FAILED;
+                matterPostResult_.error = networkReady;
+                matterPostResult_.errorText = "Wi-Fi/IPv6 non prêt pour Matter";
+                transition(AppState::MATTER_INIT_FAILED);
+            }
+            return false;
+        }
         control_heap_log("before_early_matter_init");
         esp_err_t err = matter_controller_early_init();
         if (err == ESP_OK) {
@@ -380,13 +510,13 @@ private:
         (void)matter_controller_get_last_result(result);
         ESP_LOGW("CONTROL_MATTER", "early_init_failed err=%s request=%s",
                  esp_err_to_name(err), reason ? reason : "-");
+        matterPostResult_ = {};
+        matterPostResult_.status = MatterPostCommissioningStatus::CONNECTION_FAILED;
+        matterPostResult_.error = err;
+        matterPostResult_.errorText = err == ESP_ERR_NO_MEM
+            ? "Mémoire interne insuffisante"
+            : (result.errorText.empty() ? "Initialisation Matter impossible" : result.errorText);
         if (showFailure) {
-            matterPostResult_ = {};
-            matterPostResult_.status = MatterPostCommissioningStatus::CONNECTION_FAILED;
-            matterPostResult_.error = err;
-            matterPostResult_.errorText = err == ESP_ERR_NO_MEM
-                ? "Mémoire interne insuffisante"
-                : (result.errorText.empty() ? "Initialisation Matter impossible" : result.errorText);
             transition(AppState::MATTER_INIT_FAILED);
         }
         return false;
@@ -424,7 +554,8 @@ private:
         if (event.type == WifiEventType::SCAN_COMPLETE && state_ == AppState::WIFI_SCANNING) {
             ESP_LOGI(TAG, "wifi event SCAN_DONE consumed");
             transition(AppState::WIFI_NETWORK_SELECTION);
-        } else if (event.type == WifiEventType::CONNECTED && state_ == AppState::WIFI_CONNECTING) {
+        } else if (event.type == WifiEventType::CONNECTED &&
+                   (state_ == AppState::WIFI_CONNECTING || state_ == AppState::WEATHER_HOME)) {
             ESP_LOGI("CONTROL_WIFI", "got_ip save_credentials ssid=\"%s\" password_len=%u",
                      selectedSsid_.c_str(), static_cast<unsigned>(password_.size()));
             storage_.saveWifi(selectedSsid_, password_);
@@ -432,12 +563,19 @@ private:
             savedPassword_ = password_;
             ESP_LOGI(TAG, "Connexion réussie à '%s'", selectedSsid_.c_str());
             wifi_.logNetworkDiagnostics();
-            ikea_.initializeMdns(wifi_.connectionInfo());
+#if CONFIG_CONTROL_RECOVERY_BUILD
+            (void)weather_init();
+            (void)weather_load_cache();
+            weather_ensure_placeholder();
+#else
             (void)runEarlyMatterInit("wifi_configured", false);
-            transition(AppState::WIFI_CONNECTED);
-        } else if (event.type == WifiEventType::FAILED && state_ == AppState::WIFI_CONNECTING) {
+#endif
+            (void)weather_refresh_async();
+            if (state_ == AppState::WIFI_CONNECTING) transition(AppState::WIFI_CONNECTED);
+        } else if (event.type == WifiEventType::FAILED &&
+                   (state_ == AppState::WIFI_CONNECTING || state_ == AppState::WEATHER_HOME)) {
             failureReason_ = event.reason;
-            transition(AppState::WIFI_CONNECTION_FAILED);
+            if (state_ == AppState::WIFI_CONNECTING) transition(AppState::WIFI_CONNECTION_FAILED);
         }
     }
 
@@ -464,6 +602,9 @@ private:
     }
 
     void processMatter() {
+#if CONFIG_CONTROL_RECOVERY_BUILD
+        return;
+#else
         MatterPostCommissioningResult post;
         (void)matter_controller_get_post_commissioning_result(post);
         if (post.status != lastMatterPostStatus_) {
@@ -482,13 +623,22 @@ private:
                     transition(AppState::MATTER_DEVICE_LIST);
                     break;
                 case MatterPostCommissioningStatus::COMMAND_IN_PROGRESS:
-                    transition(AppState::MATTER_COMMAND_IN_PROGRESS);
+                    if (batchCommandActive_) {
+                        ESP_LOGI("CONTROL_UI", "refresh_policy suppressed reason=matter_command_batch");
+                    } else {
+                        transition(AppState::MATTER_COMMAND_IN_PROGRESS);
+                    }
                     break;
-                case MatterPostCommissioningStatus::COMMAND_SUCCESS:
+                case MatterPostCommissioningStatus::COMMAND_SUCCESS: {
                     normalizeMatterSelection();
-                    transition(AppState::MATTER_COMMAND_SUCCESS);
+                    if (batchCommandActive_ && startNextRoomCommand()) break;
+                    const bool finishedBatch = batchCommandActive_;
+                    batchCommandActive_ = false;
+                    transition(finishedBatch ? AppState::HOME_CONTROL : AppState::MATTER_COMMAND_SUCCESS);
                     break;
+                }
                 case MatterPostCommissioningStatus::COMMAND_FAILED:
+                    batchCommandActive_ = false;
                     transition(AppState::MATTER_COMMAND_FAILED);
                     break;
                 case MatterPostCommissioningStatus::CONNECTION_FAILED:
@@ -509,7 +659,6 @@ private:
             matterPostResult_ = post;
             matterSavedNode_ = post.savedNode;
         }
-
         if (state_ != AppState::MATTER_COMMISSIONING) return;
         MatterCommissioningResult result;
         (void)matter_controller_get_last_result(result);
@@ -523,8 +672,9 @@ private:
         if (result.status == MatterCommissioningStatus::COMMISSIONED) {
             matterCommissioningUiQuiet_.store(false);
             logTaskRuntimeDiagnostics("after_commissioning_success");
-            ESP_LOGI("CONTROL_MATTER", "commissioning_success node_id=0x%llx",
-                     static_cast<unsigned long long>(result.nodeId));
+            char nodeBuf[24];
+            formatMatterNodeId(result.nodeId, nodeBuf, sizeof(nodeBuf));
+            ESP_LOGI("CONTROL_MATTER", "commissioning_success node_id=%s", nodeBuf);
             resetMatterCode();
             loadSavedMatterNode();
             transition(AppState::MATTER_COMMISSIONING_SUCCESS);
@@ -538,13 +688,21 @@ private:
                      esp_err_to_name(result.error), matterCodeError_.c_str());
             transition(AppState::MATTER_COMMISSIONING_FAILED);
         }
+#endif
     }
 
     void processTimeouts() {
-        if (autoConnectAtUs_ != 0 && state_ == AppState::HARDWARE_TEST &&
+        if (autoConnectAtUs_ != 0 &&
+            (state_ == AppState::HARDWARE_TEST || state_ == AppState::WEATHER_HOME) &&
             esp_timer_get_time() >= autoConnectAtUs_) {
             autoConnectAtUs_ = 0;
-            startConnection();
+            if (state_ == AppState::WEATHER_HOME) {
+                connectionStartedUs_ = esp_timer_get_time();
+                ESP_LOGI("CONTROL_WIFI", "auto_connect_background ssid=\"%s\"", savedSsid_.c_str());
+                (void)wifi_.connect(savedSsid_, savedPassword_);
+            } else {
+                startConnection();
+            }
         }
         if (state_ == AppState::WIFI_CONNECTING &&
             esp_timer_get_time() - connectionStartedUs_ > CONNECTION_TIMEOUT_US) {
@@ -552,6 +710,70 @@ private:
             failureReason_ = "Délai de connexion dépassé";
             transition(AppState::WIFI_CONNECTION_FAILED);
         }
+    }
+
+    void processWeather() {
+        if (!weather_poll_refresh_complete()) return;
+        ESP_LOGI("CONTROL_UI", "refresh_policy full reason=weather_refresh_complete");
+        if (state_ == AppState::WEATHER_HOME) renderUi("weather_refresh_complete");
+    }
+
+    void processPendingRender() {
+        if (!pendingRender_ || display_.busy()) return;
+        ESP_LOGI("CONTROL_UI", "render_pending_start state=%s reason=%s",
+                 appStateName(pendingRenderState_),
+                 pendingRenderReason_ ? pendingRenderReason_ : "unspecified");
+        pendingRender_ = false;
+        const bool ok = ui_.render(viewModel());
+        if (!ok && display_.busy()) {
+            pendingRender_ = true;
+            pendingRenderState_ = state_;
+            ESP_LOGI("CONTROL_UI", "render_deferred reason=display_busy state=%s",
+                     appStateName(state_));
+        }
+    }
+
+    static bool containsInsensitive(const std::string &value, const char *needle) {
+        std::string lower = value;
+        for (char &c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        std::string key = needle ? needle : "";
+        for (char &c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return lower.find(key) != std::string::npos;
+    }
+
+    void buildRoomGroups() {
+        rooms_.clear();
+        for (const auto &device : matterPostResult_.devices) {
+            if (!device.has_onoff && !device.has_switch) continue;
+            std::string room;
+            const char *source = "fallback";
+            if (containsInsensitive(device.name, "salon")) room = "Salon";
+            else if (containsInsensitive(device.name, "cuisine")) room = "Cuisine";
+            else if (containsInsensitive(device.name, "chambre")) room = "Chambre";
+            else if (containsInsensitive(device.name, "bureau")) room = "Bureau";
+            else if (containsInsensitive(device.name, "entrée") || containsInsensitive(device.name, "entree")) room = "Entrée";
+            else if (device.has_switch && !device.has_onoff) room = "Interrupteurs";
+            else if (device.has_onoff) room = "Autres lumières";
+            else room = "Autres";
+            if (source[0] == 'f' && device.name.find("Salon") != std::string::npos) source = "name_keyword";
+            if (room != "Interrupteurs" && room != "Autres lumières" && room != "Autres") source = "name_keyword";
+            size_t index = 0;
+            for (; index < rooms_.size(); ++index) if (room == rooms_[index].name) break;
+            if (index == rooms_.size()) {
+                RoomGroup group;
+                std::strncpy(group.name, room.c_str(), sizeof(group.name) - 1);
+                rooms_.push_back(group);
+            }
+            RoomGroup &group = rooms_[index];
+            if (group.endpoint_count < 16) group.endpoint_ids[group.endpoint_count++] = device.endpoint_id;
+            if (device.has_onoff) {
+                ++group.controllable_count;
+                if (device.onoff_state_known && device.onoff_state) ++group.lights_on_count;
+            }
+            ESP_LOGI("CONTROL_HOME", "room_infer endpoint=%u name=\"%s\" room=\"%s\" source=%s",
+                     device.endpoint_id, device.name.c_str(), group.name, source);
+        }
+        ESP_LOGI("CONTROL_HOME", "room_group_build count=%u", static_cast<unsigned>(rooms_.size()));
     }
 
     void processTouchEvents() {
@@ -576,6 +798,62 @@ private:
 
     void handleAction(const UiAction &a) {
         switch (a.type) {
+            case UiActionType::OPEN_HOME:
+                if (state_ == AppState::WEATHER_HOME) {
+                    if (matterEarlyInitFailed_) {
+                        transition(AppState::MATTER_INIT_FAILED);
+                        break;
+                    }
+                    loadSavedMatterNode();
+                    if (matterSavedState_ == MatterSavedState::Valid) {
+                        MatterPostCommissioningResult cached;
+                        (void)matter_controller_load_device_cache(cached);
+                        matterPostResult_ = cached;
+                        buildRoomGroups();
+                        transition(AppState::HOME_CONTROL);
+                    } else {
+                        transition(AppState::MATTER_INTRO);
+                    }
+                } else if (state_ == AppState::ROOM_DETAIL || state_ == AppState::SETTINGS_DIAGNOSTIC) {
+                    transition(AppState::HOME_CONTROL);
+                }
+                break;
+            case UiActionType::OPEN_ROOM:
+                selectedRoom_ = a.index;
+                transition(AppState::ROOM_DETAIL);
+                break;
+            case UiActionType::OPEN_WEATHER:
+                transition(AppState::WEATHER_HOME);
+                break;
+            case UiActionType::WEATHER_REFRESH:
+                if (wifi_.isConnected() && !weather_refresh_in_progress()) (void)weather_refresh_async();
+                if (state_ != AppState::WEATHER_HOME) transition(AppState::WEATHER_HOME);
+                else renderUi("weather_refresh_requested");
+                break;
+            case UiActionType::DIAGNOSTIC:
+                transition(AppState::SETTINGS_DIAGNOSTIC);
+                break;
+            case UiActionType::DISCOVER_DEVICES:
+                if (state_ == AppState::SETTINGS_DIAGNOSTIC) startMatterDiscovery();
+                else if (matterSavedState_ == MatterSavedState::Valid) startMatterDiscovery();
+                break;
+            case UiActionType::PAIR_MATTER:
+                resetMatterCode();
+                transition(AppState::MATTER_CODE_ENTRY);
+                break;
+            case UiActionType::RESET_MATTER:
+                forgetMatter();
+                break;
+            case UiActionType::ROOM_DETAIL:
+                selectedRoom_ = a.index;
+                transition(AppState::ROOM_DETAIL);
+                break;
+            case UiActionType::ROOM_ON:
+                startRoomBatch(a.index, true);
+                break;
+            case UiActionType::ROOM_OFF:
+                startRoomBatch(a.index, false);
+                break;
             case UiActionType::CONFIGURE_WIFI: startScan(); break;
             case UiActionType::BACK:
                 if (state_ == AppState::MATTER_NOT_IMPLEMENTED ||
@@ -680,7 +958,13 @@ private:
                     state_ == AppState::MATTER_DISCOVERY_FAILED) {
                     startMatterDiscovery();
                 } else if (state_ == AppState::MATTER_INIT_FAILED) {
-                    if (runEarlyMatterInit("ui_retry", true)) openMatterHome();
+                    MatterCommissioningResult result;
+                    (void)matter_controller_get_last_result(result);
+                    matterPostResult_.status = MatterPostCommissioningStatus::CONNECTION_FAILED;
+                    matterPostResult_.error = result.error == ESP_OK ? ESP_FAIL : result.error;
+                    matterPostResult_.errorText = "Redémarrer ou réinitialiser Matter avant de réessayer";
+                    ESP_LOGW("CONTROL_MATTER", "retry_rejected reason=previous_init_failure_requires_reboot_or_cleanup");
+                    renderUi("matter_retry_rejected");
                 } else if (state_ == AppState::MATTER_COMMAND_FAILED) {
                     retryMatterCommand();
                 } else {
@@ -726,21 +1010,18 @@ private:
                 break;
             case UiActionType::MATTER_PAIR_INITIAL:
                 matterMultiAdminMode_ = false;
-                matterContinueWithoutPrescan_ = false;
                 matter_controller_set_pending_commissioning_mode(false);
                 ESP_LOGI("CONTROL_MATTER", "commissioning_mode=initial");
                 continueAfterMatterCodeConfirm();
                 break;
             case UiActionType::MATTER_PAIR_MULTI_ADMIN:
                 matterMultiAdminMode_ = true;
-                matterContinueWithoutPrescan_ = false;
                 matter_controller_set_pending_commissioning_mode(true);
                 ESP_LOGI("CONTROL_MATTER", "commissioning_mode=multi_admin");
                 continueAfterMatterCodeConfirm();
                 break;
             case UiActionType::MATTER_CONTINUE_ANYWAY:
-                matterContinueWithoutPrescan_ = true;
-                ESP_LOGW("CONTROL_MATTER", "mdns_prescan_override=continue_anyway");
+                ESP_LOGI("CONTROL_MATTER", "chip_discovery=pairing_code continuation=explicit");
                 continueAfterMatterCodeConfirm();
                 break;
             case UiActionType::MATTER_USE_SAVED:
@@ -796,6 +1077,12 @@ private:
     }
 
     void loadSavedMatterNode() {
+#if CONFIG_CONTROL_RECOVERY_BUILD
+        matterSavedState_ = MatterSavedState::None;
+        matterSavedStateReason_.clear();
+        matterSavedNode_ = {};
+        return;
+#else
         MatterSavedNode node;
         std::string reason;
         matterSavedState_ = matter_saved_state_load_and_validate(node, reason);
@@ -805,6 +1092,7 @@ private:
         } else {
             matterSavedNode_ = {};
         }
+#endif
     }
 
     void openMatterHome() {
@@ -949,6 +1237,56 @@ private:
         }
     }
 
+    bool startNextRoomCommand() {
+        if (!batchCommandActive_ || batchCommandPosition_ >= batchCommandEndpoints_.size()) return false;
+        const uint16_t endpoint = batchCommandEndpoints_[batchCommandPosition_++];
+        lastMatterCommandEndpoint_ = endpoint;
+        lastMatterCommandOn_ = batchCommandOn_;
+        ESP_LOGI("CONTROL_HOME", "room_batch endpoint=%u action=%s", endpoint, batchCommandOn_ ? "on" : "off");
+        const esp_err_t err = batchCommandOn_
+            ? matter_controller_send_on(matterSavedNode_.node_id, endpoint)
+            : matter_controller_send_off(matterSavedNode_.node_id, endpoint);
+        if (err != ESP_OK) {
+            batchCommandActive_ = false;
+            matterPostResult_.error = err;
+            matterPostResult_.errorText = "Commande de pièce échouée";
+            transition(AppState::MATTER_COMMAND_FAILED);
+            return false;
+        }
+        return true;
+    }
+
+    void startRoomBatch(int roomIndex, bool on) {
+        if (roomIndex < 0 || roomIndex >= static_cast<int>(rooms_.size())) return;
+        const RoomGroup &room = rooms_[roomIndex];
+        batchCommandEndpoints_.clear();
+        for (uint8_t i = 0; i < room.endpoint_count; ++i) {
+            for (const auto &device : matterPostResult_.devices) {
+                if (device.endpoint_id != room.endpoint_ids[i]) continue;
+                if (!device.has_onoff) {
+                    ESP_LOGI("CONTROL_HOME", "endpoint_skip endpoint=%u reason=no_onoff_cluster", device.endpoint_id);
+                } else {
+                    batchCommandEndpoints_.push_back(device.endpoint_id);
+                }
+                break;
+            }
+        }
+        ESP_LOGI("CONTROL_HOME", "room_action room=\"%s\" action=%s endpoints=%u",
+                 room.name, on ? "on" : "off", static_cast<unsigned>(batchCommandEndpoints_.size()));
+        if (batchCommandEndpoints_.empty()) {
+            ESP_LOGI("CONTROL_UI", "batch_render_pending=yes");
+            renderUi("batch_empty");
+            return;
+        }
+        batchCommandOn_ = on;
+        batchCommandPosition_ = 0;
+        batchCommandActive_ = true;
+        lastMatterPostStatus_ = MatterPostCommissioningStatus::IDLE;
+        matterPostResult_.status = MatterPostCommissioningStatus::COMMAND_IN_PROGRESS;
+        ESP_LOGI("CONTROL_UI", "batch_render_pending=yes");
+        (void)startNextRoomCommand();
+    }
+
     void retryMatterCommand() {
         if (lastMatterCommandEndpoint_ == 0) {
             transition(AppState::MATTER_DEVICE_LIST);
@@ -1056,25 +1394,7 @@ private:
         if (matterMultiAdminMode_) {
             ESP_LOGI("CONTROL_MATTER", "multi_admin_instruction=use_new_sharing_code_from_existing_fabric");
         }
-        bool mdnsFound = false;
-        const esp_err_t prescanErr = matter_controller_mdns_prescan(mdnsFound, 3000);
-        if (prescanErr == ESP_OK && !mdnsFound && !matterContinueWithoutPrescan_) {
-            matterCommissioningResult_.status = MatterCommissioningStatus::FAILED;
-            matterCommissioningResult_.error = ESP_ERR_NOT_FOUND;
-            matterCommissioningResult_.failure_stage = "mdns_prescan";
-            matterCommissioningResult_.failure_reason = "mdns_prescan_no_commissionable_service";
-            matterCommissioningResult_.errorText = "Aucun hub Matter détecté";
-            matterCodeError_ = matterCommissioningResult_.errorText;
-            ESP_LOGW("CONTROL_MATTER", "commissioning_preflight_failed reason=mdns_prescan_no_commissionable_service mode=%s",
-                     matterMultiAdminMode_ ? "multi_admin" : "initial");
-            transition(AppState::MATTER_MDNS_PRESCAN_EMPTY);
-            return;
-        }
-        if (prescanErr != ESP_OK) {
-            ESP_LOGW("CONTROL_MATTER", "mdns_prescan_error err=%s continue=yes",
-                     esp_err_to_name(prescanErr));
-        }
-        matterContinueWithoutPrescan_ = false;
+        ESP_LOGI("CONTROL_NETWORK", "discovery_owner=chip pairing_api=pairing_code");
         transitionState(AppState::MATTER_COMMISSIONING);
         const bool progressRendered = renderUiEvenIfMatterQuiet("commissioning_progress_barrier");
         ESP_LOGI("CONTROL_MATTER", "commissioning_progress_screen_rendered=%s",
@@ -1246,11 +1566,20 @@ private:
     MatterPostCommissioningStatus lastMatterPostStatus_ = MatterPostCommissioningStatus::IDLE;
     size_t matterDevicePage_ = 0;
     int selectedMatterDevice_ = -1;
+    std::vector<RoomGroup> rooms_;
+    int selectedRoom_ = -1;
+    std::vector<uint16_t> batchCommandEndpoints_;
+    size_t batchCommandPosition_ = 0;
+    bool batchCommandOn_ = false;
+    bool batchCommandActive_ = false;
     uint16_t lastMatterCommandEndpoint_ = 0;
     bool lastMatterCommandOn_ = false;
     std::string matterCodeError_;
+    bool matterEarlyInitFailed_ = false;
     bool matterMultiAdminMode_ = false;
-    bool matterContinueWithoutPrescan_ = false;
+    bool pendingRender_ = false;
+    AppState pendingRenderState_ = AppState::BOOT;
+    const char *pendingRenderReason_ = "unspecified";
 #if CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL
     TaskHandle_t matterCommissioningTask_ = nullptr;
     std::string matterWorkerCode_;
@@ -1271,7 +1600,11 @@ extern "C" void app_main(void) {
         vTaskDelete(nullptr);
         return;
     }
+    ESP_LOGI("CONTROL_TASKS", "main_stack_high_water_before_render=%u",
+             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
     application.renderInitialScreen();
+    ESP_LOGI("CONTROL_TASKS", "main_stack_high_water_after_render=%u",
+             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
     (void)application.startTouchTask();
     application.runRecoveryIdleLoop();
 }

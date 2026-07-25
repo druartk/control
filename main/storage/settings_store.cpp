@@ -19,20 +19,21 @@ std::string getString(nvs_handle_t handle, const char *key) {
 }
 
 bool SettingsStore::initialize() {
+    ESP_LOGI(TAG, "nvs_init start");
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_LOGW(TAG, "NVS incompatible ou pleine; effacement de récupération");
+        ESP_LOGW(TAG, "nvs_init recovery_erase reason=%s", esp_err_to_name(err));
         err = nvs_flash_erase();
         if (err == ESP_OK) err = nvs_flash_init();
     }
+    ESP_LOGI(TAG, "nvs_init result=%s", esp_err_to_name(err));
     if (err != ESP_OK) {
         status_ = "NVS indisponible";
-        ESP_LOGE(TAG, "%s: %s; fonctionnement sans persistance", status_.c_str(), esp_err_to_name(err));
+        ESP_LOGE(TAG, "nvs_init failed err=%s", esp_err_to_name(err));
         return false;
     }
     ready_ = true;
     status_ = "OK";
-    ESP_LOGI(TAG, "NVS initialisée");
     return true;
 }
 

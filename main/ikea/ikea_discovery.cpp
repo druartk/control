@@ -12,8 +12,9 @@
 #include "lwip/netdb.h"
 #include "ping/ping_sock.h"
 #include "sdkconfig.h"
+#include "network/mdns_manager.h"
 
-#if CONFIG_CONTROL_IKEA_MDNS_DISCOVERY
+#if CONFIG_CONTROL_IKEA_LEGACY_MDNS_DISCOVERY
 #include "mdns.h"
 #endif
 
@@ -78,13 +79,15 @@ std::string serviceName(const ServiceQuery &query) {
     return std::string(query.type) + "." + query.proto;
 }
 
+#if CONFIG_CONTROL_IKEA_LEGACY_MDNS_DISCOVERY
 std::string ip4ToString(const esp_ip4_addr_t &addr) {
     char ip[INET_ADDRSTRLEN]{};
     inet_ntop(AF_INET, &addr, ip, sizeof(ip));
     return ip;
 }
+#endif
 
-#if CONFIG_CONTROL_IKEA_MDNS_DISCOVERY
+#if CONFIG_CONTROL_IKEA_LEGACY_MDNS_DISCOVERY
 std::string firstIpv4(mdns_result_t *result) {
     for (mdns_ip_addr_t *addr = result ? result->addr : nullptr; addr != nullptr; addr = addr->next) {
         if (addr->addr.type == ESP_IPADDR_TYPE_V4) {
@@ -124,29 +127,19 @@ void onPingEnd(esp_ping_handle_t, void *args) {
 }
 
 bool IkeaDiscovery::initializeMdns(const WifiConnectionInfo &wifi) {
-#if CONFIG_CONTROL_IKEA_MDNS_DISCOVERY
+#if CONFIG_CONTROL_IKEA_LEGACY_MDNS_DISCOVERY
     if (!wifi.hasIpv4) {
         ESP_LOGE(TAG, "mdns_init failed err=no_ipv4");
         return false;
     }
     if (mdnsInitialized_.load()) return true;
-    ESP_LOGI(TAG, "mdns_init start");
-    esp_err_t err = mdns_init();
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "mdns_init failed err=%s", esp_err_to_name(err));
-        return false;
-    }
-    err = mdns_hostname_set("control-t5");
-    if (err == ESP_OK) err = mdns_instance_name_set("Control T5");
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "mdns_init failed err=%s", esp_err_to_name(err));
-        return false;
-    }
+    const esp_err_t err = control_mdns_init();
+    if (err != ESP_OK) return false;
     mdnsInitialized_ = true;
-    ESP_LOGI(TAG, "mdns_init ok hostname=control-t5");
+    ESP_LOGI(TAG, "mdns_shared_ready");
     return true;
 #else
-    ESP_LOGW(TAG, "mdns_init skipped reason=CONFIG_CONTROL_IKEA_MDNS_DISCOVERY_disabled");
+    ESP_LOGW(TAG, "mdns_init skipped reason=CONFIG_CONTROL_IKEA_LEGACY_MDNS_DISCOVERY_disabled");
     (void)wifi;
     return false;
 #endif
@@ -305,7 +298,7 @@ void IkeaDiscovery::run() {
         knownIpReachable = probeKnownIp(knownIp, knownIpResult);
     }
 
-#if CONFIG_CONTROL_IKEA_MDNS_DISCOVERY
+#if CONFIG_CONTROL_IKEA_LEGACY_MDNS_DISCOVERY
     if (!initializeMdns(wifi_)) {
         result_.classification = IkeaDiscoveryClassification::DISCOVERY_ERROR;
         result_.summary = "Initialisation mDNS impossible.";
@@ -370,7 +363,7 @@ void IkeaDiscovery::run() {
 }
 
 bool IkeaDiscovery::browseServices(IkeaDiscoveryResult &out, size_t &serviceCount, size_t &matterServiceCount) {
-#if CONFIG_CONTROL_IKEA_MDNS_DISCOVERY
+#if CONFIG_CONTROL_IKEA_LEGACY_MDNS_DISCOVERY
     for (const auto &query : SERVICE_TYPES) {
         if (cancelRequested_.load()) return false;
         const std::string fullType = serviceName(query);

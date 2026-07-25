@@ -1,0 +1,32 @@
+# Conservative recovery build. This file is layered on top of the safe
+# defaults and is intentionally independent from sdkconfig.defaults.matter.
+CONFIG_CONTROL_RECOVERY_BUILD=y
+
+# Keep the recovery image limited to NVS, display, touch, Wi-Fi, and setup UI.
+# CONFIG_CONTROL_IKEA_DISCOVERY is not set
+# CONFIG_CONTROL_IKEA_LEGACY_MDNS_DISCOVERY is not set
+# CONFIG_CONTROL_IKEA_HOSTNAME_FALLBACK is not set
+# CONFIG_CONTROL_IKEA_IP_DIAGNOSTICS is not set
+# CONFIG_CONTROL_MATTER_CONTROLLER is not set
+# CONFIG_CONTROL_MATTER_COMMISSIONING is not set
+# CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL is not set
+# CONFIG_CONTROL_MATTER_ALLOW_UNTRUSTED_ATTESTATION is not set
+
+# Keep NVS, Wi-Fi, and FreeRTOS allocations internal and conservative.
+# CONFIG_NVS_ALLOCATE_CACHE_IN_SPIRAM is not set
+# CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is not set
+# CONFIG_SPIRAM_ALLOW_NOINIT_SEG_EXTERNAL_MEMORY is not set
+# CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP is not set
+# ESP-IDF 5.4.2 has no FREERTOS_PLACE_TASK_STACKS_IN_EXT_RAM symbol;
+# FREERTOS_TASK_CREATE_ALLOW_EXT_MEM below is the supported stack-placement
+# control and keeps task stacks internal.
+# CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM is not set
+
+# Use the normal internal implementations.
+# CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH is not set
+# CONFIG_RINGBUF_PLACE_FUNCTIONS_INTO_FLASH is not set
+# CONFIG_HEAP_PLACE_FUNCTION_INTO_FLASH is not set
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=24576
+CONFIG_ESP_TIMER_TASK_STACK_SIZE=4096
+# CONFIG_NEWLIB_NANO_FORMAT is not set

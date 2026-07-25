@@ -2,6 +2,10 @@
 
 enum class AppState {
     BOOT,
+    WEATHER_HOME,
+    HOME_CONTROL,
+    ROOM_DETAIL,
+    SETTINGS_DIAGNOSTIC,
     HARDWARE_TEST,
     WIFI_SCANNING,
     WIFI_NETWORK_SELECTION,
@@ -41,6 +45,10 @@ enum class AppState {
 inline const char *appStateName(AppState state) {
     switch (state) {
         case AppState::BOOT: return "BOOT";
+        case AppState::WEATHER_HOME: return "WEATHER_HOME";
+        case AppState::HOME_CONTROL: return "HOME_CONTROL";
+        case AppState::ROOM_DETAIL: return "ROOM_DETAIL";
+        case AppState::SETTINGS_DIAGNOSTIC: return "SETTINGS_DIAGNOSTIC";
         case AppState::HARDWARE_TEST: return "HARDWARE_TEST";
         case AppState::WIFI_SCANNING: return "WIFI_SCANNING";
         case AppState::WIFI_NETWORK_SELECTION: return "WIFI_NETWORK_SELECTION";

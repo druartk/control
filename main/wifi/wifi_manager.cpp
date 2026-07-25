@@ -88,6 +88,13 @@ bool WifiManager::initialize() {
         ESP_LOGE(TAG, "%s: %s", status_.c_str(), esp_err_to_name(err));
         return false;
     }
+    err = esp_wifi_set_ps(WIFI_PS_NONE);
+    ESP_LOGI(TAG, "power_save disabled result=%s", esp_err_to_name(err));
+    if (err != ESP_OK) {
+        status_ = "Échec configuration économie Wi-Fi";
+        ESP_LOGE(TAG, "%s: %s", status_.c_str(), esp_err_to_name(err));
+        return false;
+    }
     initialized_ = true;
     status_ = "Prêt";
     ESP_LOGI(TAG, "Wi-Fi station initialisé");
@@ -121,7 +128,11 @@ bool WifiManager::connect(const std::string &ssid, const std::string &password) 
     config.sta.pmf_cfg.required = false;
     esp_wifi_disconnect();
     esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &config);
-    if (err == ESP_OK) err = esp_wifi_connect();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "esp_wifi_connect start ssid=\"%s\"", ssid.c_str());
+        err = esp_wifi_connect();
+        ESP_LOGI(TAG, "esp_wifi_connect result=%s", esp_err_to_name(err));
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Connexion à '%s' impossible à démarrer: %s", ssid.c_str(), esp_err_to_name(err));
         return false;
@@ -162,6 +173,28 @@ bool WifiManager::hasIpv6LinkLocal() const {
     return esp_netif_ip6_get_addr_type(&ip6) == ESP_IP6_ADDR_IS_LINK_LOCAL;
 }
 
+esp_err_t WifiManager::waitGotIp(uint32_t timeout_ms) {
+    ESP_LOGI(TAG, "wait_got_ip start timeout_ms=%u", static_cast<unsigned>(timeout_ms));
+    const int64_t deadline = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000;
+    while (esp_timer_get_time() < deadline) {
+        const WifiStatusEvent event = poll();
+        if (event.type == WifiEventType::CONNECTED || isConnected()) {
+            const WifiConnectionInfo info = connectionInfo();
+            ESP_LOGI(TAG, "wait_got_ip result=ESP_OK ip=%s",
+                     info.ipv4.empty() ? "unknown" : info.ipv4.c_str());
+            return ESP_OK;
+        }
+        if (event.type == WifiEventType::FAILED) {
+            ESP_LOGW(TAG, "wait_got_ip failed reason=%s", event.reason.c_str());
+            return ESP_FAIL;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    ESP_LOGW(TAG, "wait_got_ip timeout");
+    ESP_LOGW(TAG, "wifi_timeout_note phy_nvs_calibration_warning_seen_possible=yes");
+    return ESP_ERR_TIMEOUT;
+}
+
 esp_err_t WifiManager::waitMatterNetworkReady(uint32_t timeout_ms) {
     const int64_t deadline = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000;
     bool createIp6Requested = false;
@@ -197,6 +230,8 @@ void WifiManager::eventHandler(void *arg, esp_event_base_t base, int32_t id, voi
     auto *self = static_cast<WifiManager *>(arg);
     if (base == WIFI_EVENT && id == WIFI_EVENT_SCAN_DONE) {
         self->pending_ = PENDING_SCAN;
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
+        ESP_LOGI(TAG, "WIFI_EVENT_STA_CONNECTED");
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED && self->connecting_) {
         auto *event = static_cast<wifi_event_sta_disconnected_t *>(data);
         self->failureReason_ = event->reason;
@@ -204,14 +239,12 @@ void WifiManager::eventHandler(void *arg, esp_event_base_t base, int32_t id, voi
         self->connected_ = false;
         self->pending_ = PENDING_FAILED;
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ESP_LOGI(TAG, "IP_EVENT_STA_GOT_IP");
         self->connecting_ = false;
         self->connected_ = true;
-        if (self->stationNetif_) {
-            const esp_err_t ip6Err = esp_netif_create_ip6_linklocal(self->stationNetif_);
-            ESP_LOGI(TAG, "ipv6_linklocal_create_on_got_ip result=%s", esp_err_to_name(ip6Err));
-        }
         (void)control_time_start_sntp_once();
         self->pending_ = PENDING_CONNECTED;
+        ESP_LOGI(TAG, "got_ip_processing_done");
     }
 }
 
@@ -293,7 +326,14 @@ WifiConnectionInfo WifiManager::connectionInfo() const {
         info.dns = ip4ToString(dns.ip.u_addr.ip4);
     }
     wifi_ap_record_t ap{};
-    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) info.rssi = ap.rssi;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        if (ap.ssid[0] != '\0') info.ssid = reinterpret_cast<const char *>(ap.ssid);
+        info.rssi = ap.rssi;
+        char bssid[18];
+        snprintf(bssid, sizeof(bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5]);
+        info.bssid = bssid;
+    }
     uint8_t mac[6]{};
     if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
         char buffer[18];
@@ -306,7 +346,7 @@ WifiConnectionInfo WifiManager::connectionInfo() const {
 
 void WifiManager::logNetworkDiagnostics() const {
     const WifiConnectionInfo info = connectionInfo();
-    ESP_LOGI(TAG, "network_diag ssid=\"%s\" ip=%s ipv6_ll=%s gw=%s netmask=%s dns=%s rssi=%d mac=%s",
+    ESP_LOGI(TAG, "network_diag ssid=\"%s\" ip=%s ipv6_ll=%s gw=%s netmask=%s dns=%s rssi=%d bssid=%s mac=%s",
              info.ssid.c_str(),
              info.ipv4.empty() ? "unknown" : info.ipv4.c_str(),
              info.ipv6LinkLocal.empty() ? "none" : info.ipv6LinkLocal.c_str(),
@@ -314,6 +354,7 @@ void WifiManager::logNetworkDiagnostics() const {
              info.netmask.empty() ? "unknown" : info.netmask.c_str(),
              info.dns.empty() ? "unknown" : info.dns.c_str(),
              info.rssi,
+             info.bssid.empty() ? "unknown" : info.bssid.c_str(),
              info.mac.empty() ? "unknown" : info.mac.c_str());
 }
 

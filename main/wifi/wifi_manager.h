@@ -31,6 +31,7 @@ struct WifiConnectionInfo {
     std::string netmask;
     std::string dns;
     std::string mac;
+    std::string bssid;
     int8_t rssi = 0;
     bool hasIpv4 = false;
     bool hasIpv6LinkLocal = false;
@@ -45,6 +46,7 @@ public:
     void releaseTransientBuffers();
     bool isConnected() const;
     bool hasIpv6LinkLocal() const;
+    esp_err_t waitGotIp(uint32_t timeout_ms);
     esp_err_t waitMatterNetworkReady(uint32_t timeout_ms);
     WifiStatusEvent poll();
     const std::vector<WifiNetwork> &networks() const { return networks_; }
