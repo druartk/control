@@ -78,6 +78,8 @@ idf_component_register(
         "main.cpp"
         "display/display_manager.cpp"
         "touch/touch_manager.cpp"
+        "ui/control_ui_model.cpp"
+        "ui/control_ui.cpp"
         "ui/ui_manager.cpp"
         "wifi/wifi_manager.cpp"
         "system/control_heap.cpp"

@@ -5,6 +5,7 @@
 #include <string>
 #include <cstring>
 #include <cctype>
+#include <ctime>
 #include "app_state.h"
 #include "board/board_config.h"
 #include "display/display_manager.h"
@@ -23,6 +24,7 @@
 #include "system/control_heap.h"
 #include "system/control_time.h"
 #include "touch/touch_manager.h"
+#include "ui/control_ui.h"
 #include "ui/ui_manager.h"
 #include "wifi/wifi_manager.h"
 #include "weather/weather_manager.h"
@@ -91,7 +93,7 @@ const char *ikeaClassificationName(IkeaDiscoveryClassification classification) {
 
 class ControlApplication {
 public:
-    ControlApplication() : ui_(display_) {}
+    ControlApplication() : ui_(display_), controlUi_(display_) {}
 
     bool initialize() {
         ESP_LOGI(TAG, "Control %s — build %s %s — ESP-IDF %s", CONTROL_FW_VERSION,
@@ -215,6 +217,13 @@ public:
             MatterPostCommissioningResult cached;
             (void)matter_controller_load_device_cache(cached);
             matterPostResult_ = cached;
+#if CONFIG_CONTROL_UI_DASHBOARD_V1
+            if (displayOk && touchOk) {
+                dashboardAvailable_ = true;
+                controlUi_.init();
+                bindControlUiMatter(cached);
+            }
+#endif
             state_ = AppState::WEATHER_HOME;
         } else {
             state_ = !savedSsid_.empty() ? AppState::WEATHER_HOME : AppState::HARDWARE_TEST;
@@ -234,6 +243,12 @@ public:
     }
 
     void renderInitialScreen() {
+#if CONFIG_CONTROL_UI_DASHBOARD_V1
+        if (dashboardAvailable_ && state_ == AppState::WEATHER_HOME) {
+            controlUi_.showHome();
+            renderUi("screen_enter");
+        } else
+#endif
         if (state_ == AppState::WEATHER_HOME || state_ == AppState::WIFI_CONNECTED || state_ == AppState::MATTER_INTRO) {
             ESP_LOGI(TAG, "boot_phase=weather_home_render");
             ESP_LOGI(TAG, "boot_screen=WEATHER_HOME");
@@ -378,6 +393,12 @@ private:
         }
         ESP_LOGI("CONTROL_UI", "render reason=%s state=%s",
                  reason ? reason : "unspecified", appStateName(state_));
+#if CONFIG_CONTROL_UI_DASHBOARD_V1
+        if (dashboardAvailable_ && state_ == AppState::WEATHER_HOME) {
+            updateControlUiContext();
+            return controlUi_.render(reason && std::strcmp(reason, "screen_enter") == 0);
+        }
+#endif
         const bool ok = ui_.render(viewModel());
         if (!ok && display_.busy()) {
             pendingRender_ = true;
@@ -605,6 +626,7 @@ private:
 #if CONFIG_CONTROL_RECOVERY_BUILD
         return;
 #else
+        processControlUiMatterResults();
         MatterPostCommissioningResult post;
         (void)matter_controller_get_post_commissioning_result(post);
         if (post.status != lastMatterPostStatus_) {
@@ -614,6 +636,9 @@ private:
             lastMatterPostStatus_ = post.status;
             matterPostResult_ = post;
             matterSavedNode_ = post.savedNode;
+#if CONFIG_CONTROL_UI_DASHBOARD_V1
+            if (post.status == MatterPostCommissioningStatus::DEVICE_LIST) bindControlUiMatter(post);
+#endif
             switch (post.status) {
                 case MatterPostCommissioningStatus::DEVICE_DISCOVERY:
                     if (state_ != AppState::MATTER_DEVICE_DISCOVERY) transition(AppState::MATTER_DEVICE_DISCOVERY);
@@ -677,7 +702,17 @@ private:
             ESP_LOGI("CONTROL_MATTER", "commissioning_success node_id=%s", nodeBuf);
             resetMatterCode();
             loadSavedMatterNode();
+#if CONFIG_CONTROL_UI_DASHBOARD_V1
+            dashboardAvailable_ = true;
+            controlUi_.init();
+            MatterPostCommissioningResult cached;
+            (void)matter_controller_load_device_cache(cached);
+            matterPostResult_ = cached;
+            bindControlUiMatter(cached);
+            transition(AppState::WEATHER_HOME);
+#else
             transition(AppState::MATTER_COMMISSIONING_SUCCESS);
+#endif
         } else {
             matterCommissioningUiQuiet_.store(false);
             logTaskRuntimeDiagnostics("after_commissioning_failure");
@@ -724,6 +759,13 @@ private:
                  appStateName(pendingRenderState_),
                  pendingRenderReason_ ? pendingRenderReason_ : "unspecified");
         pendingRender_ = false;
+#if CONFIG_CONTROL_UI_DASHBOARD_V1
+        if (dashboardAvailable_ && state_ == AppState::WEATHER_HOME) {
+            updateControlUiContext();
+            (void)controlUi_.render(false);
+            return;
+        }
+#endif
         const bool ok = ui_.render(viewModel());
         if (!ok && display_.busy()) {
             pendingRender_ = true;
@@ -732,6 +774,42 @@ private:
                      appStateName(state_));
         }
     }
+
+#if CONFIG_CONTROL_UI_DASHBOARD_V1
+    void bindControlUiMatter(const MatterPostCommissioningResult &result) {
+        matter_controller_log_ui_endpoints(result);
+        controlUi_.bindMatterDevices(result.savedNode.node_id, result.devices);
+#if CONFIG_CONTROL_UI_MATTER_COMMANDS
+        const esp_err_t err = matter_controller_ui_init();
+        if (err != ESP_OK) {
+            ESP_LOGW("CONTROL_MATTER_UI", "queue_init_failed err=%s", esp_err_to_name(err));
+        }
+#endif
+    }
+
+    void processControlUiMatterResults() {
+#if CONFIG_CONTROL_UI_MATTER_COMMANDS
+        if (!dashboardAvailable_) return;
+        MatterUiResult result;
+        bool changed = false;
+        while (matter_controller_ui_poll_result(result)) {
+            controlUi_.completeMatterCommand(result);
+            changed = true;
+        }
+        if (changed && state_ == AppState::WEATHER_HOME) renderUi("matter_ui_command_complete");
+#endif
+    }
+
+    void updateControlUiContext() {
+        time_t now = time(nullptr);
+        struct tm calendar = {};
+        char clockText[8] = "--:--";
+        if (now != static_cast<time_t>(-1) && localtime_r(&now, &calendar) != nullptr) {
+            strftime(clockText, sizeof(clockText), "%H:%M", &calendar);
+        }
+        controlUi_.setContext(wifi_.isConnected(), clockText);
+    }
+#endif
 
     static bool containsInsensitive(const std::string &value, const char *needle) {
         std::string lower = value;
@@ -787,6 +865,15 @@ private:
             ESP_LOGI("CONTROL_TOUCH", "event ignored quiet=matter_commissioning");
             return;
         }
+#if CONFIG_CONTROL_UI_DASHBOARD_V1
+        if (dashboardAvailable_ && state_ == AppState::WEATHER_HOME) {
+            if (controlUi_.handleTouch(event)) {
+                updateControlUiContext();
+                (void)controlUi_.render(false);
+            }
+            return;
+        }
+#endif
 #if CONFIG_CONTROL_TOUCH_UI_DISPATCH
         if (event.type != TouchEventType::PRESS) return;
         const UiAction action = ui_.hitTest(viewModel(), event.x, event.y);
@@ -1543,6 +1630,10 @@ private:
     MatterOnboarding matter_;
     IkeaDiscovery ikea_;
     UiManager ui_;
+#if CONFIG_CONTROL_UI_DASHBOARD_V1
+    ControlUi controlUi_;
+    bool dashboardAvailable_ = false;
+#endif
     std::string selectedSsid_;
     std::string password_;
     std::string savedSsid_;

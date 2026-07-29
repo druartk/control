@@ -103,6 +103,26 @@ struct MatterPostCommissioningResult {
     bool commandState = false;
 };
 
+enum class MatterUiAction : uint8_t {
+    SetOn,
+    SetOff,
+    Toggle,
+};
+
+struct MatterUiCommand {
+    uint64_t node_id = 0;
+    uint16_t endpoint_id = 0;
+    MatterUiAction action = MatterUiAction::SetOff;
+    uint32_t ui_device_id = 0;
+    uint32_t batch_id = 0;
+};
+
+struct MatterUiResult {
+    MatterUiCommand command;
+    bool success = false;
+    esp_err_t error = ESP_FAIL;
+};
+
 esp_err_t matter_controller_init();
 esp_err_t matter_controller_early_init();
 esp_err_t matter_controller_start_platform();
@@ -127,6 +147,10 @@ esp_err_t matter_controller_start_device_discovery();
 esp_err_t matter_controller_get_post_commissioning_result(MatterPostCommissioningResult &out);
 esp_err_t matter_controller_load_device_cache(MatterPostCommissioningResult &out);
 esp_err_t matter_controller_clear_device_cache();
+void matter_controller_log_ui_endpoints(const MatterPostCommissioningResult &result);
+esp_err_t matter_controller_ui_init();
+esp_err_t matter_controller_ui_enqueue(const MatterUiCommand &command);
+bool matter_controller_ui_poll_result(MatterUiResult &out);
 esp_err_t matter_controller_send_on(uint64_t node_id, uint16_t endpoint_id);
 esp_err_t matter_controller_send_off(uint64_t node_id, uint16_t endpoint_id);
 esp_err_t matter_controller_read_onoff(uint64_t node_id, uint16_t endpoint_id, bool &out_state);

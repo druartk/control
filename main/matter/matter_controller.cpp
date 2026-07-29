@@ -109,6 +109,7 @@ constexpr uint64_t CONTROL_CONTROLLER_FABRIC_ID = 1ULL;
 constexpr uint16_t CONTROL_CONTROLLER_LISTEN_PORT = 5580;
 constexpr uint32_t DISCOVERY_WORKER_STACK_SIZE = 16384;
 constexpr uint32_t COMMAND_WORKER_STACK_SIZE = 12288;
+constexpr size_t COMMAND_QUEUE_LENGTH = 8;
 constexpr UBaseType_t MATTER_DISCOVERY_WORKER_PRIORITY = 7;
 constexpr UBaseType_t MATTER_COMMAND_WORKER_PRIORITY = 7;
 constexpr uint64_t CONTROL_FABRIC_CONFLICT_REMOTE_NODE_ID = 0x12344322ULL;
@@ -122,6 +123,8 @@ constexpr const char *MATTER_OPCERT_NVS_NAMESPACE = "chip-opcert";
 bool g_attestationBypassObserved = false;
 TaskHandle_t g_discoveryTask = nullptr;
 TaskHandle_t g_commandTask = nullptr;
+QueueHandle_t g_commandQueue = nullptr;
+QueueHandle_t g_uiResultQueue = nullptr;
 
 struct ReadWaitContext {
     SemaphoreHandle_t done = nullptr;
@@ -170,6 +173,11 @@ struct CommandWaitContext {
     CHIP_ERROR chip_error = CHIP_ERROR_TIMEOUT;
     bool got_result = false;
     uint16_t endpoint_id = 0;
+};
+
+struct CommandWorkerArgs {
+    bool from_ui = false;
+    MatterUiCommand ui_command;
 };
 
 ReadWaitContext *g_activeRead = nullptr;
@@ -2195,57 +2203,102 @@ void matterDiscoveryWorker(void *) {
     vTaskDelete(nullptr);
 }
 
-struct CommandWorkerArgs {
-    uint64_t node_id;
-    uint16_t endpoint_id;
-    bool on;
-};
+void matterCommandWorker(void *arg);
 
-void matterCommandWorker(void *arg) {
+esp_err_t ensureCommandWorker() {
+    if (g_commandQueue == nullptr) {
+        g_commandQueue = xQueueCreate(COMMAND_QUEUE_LENGTH, sizeof(CommandWorkerArgs));
+        if (!g_commandQueue) return ESP_ERR_NO_MEM;
+    }
+    if (g_commandTask != nullptr) return ESP_OK;
+    const BaseType_t created = xTaskCreate(
+        matterCommandWorker, "control_matter_cmd", COMMAND_WORKER_STACK_SIZE, nullptr,
+        MATTER_COMMAND_WORKER_PRIORITY, &g_commandTask);
+    if (created != pdPASS) {
+        g_commandTask = nullptr;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+void matterCommandWorker(void *) {
     ESP_LOGI(TAG, "worker_stack_size=%u task=command", static_cast<unsigned>(COMMAND_WORKER_STACK_SIZE));
     logCurrentTaskDiagnostics("command", "worker_start");
-    auto *args = static_cast<CommandWorkerArgs *>(arg);
-    const uint32_t commandId = args->on
-        ? chip::app::Clusters::OnOff::Commands::On::Id
-        : chip::app::Clusters::OnOff::Commands::Off::Id;
-    char nodeBuf[24];
-    formatMatterId(args->node_id, nodeBuf, sizeof(nodeBuf));
-    ESP_LOGI(TAG, "%s node_id=%s endpoint=%u",
-             args->on ? "command_on" : "command_off",
-             nodeBuf, args->endpoint_id);
-    g_postResult.status = MatterPostCommissioningStatus::COMMAND_IN_PROGRESS;
-    g_postResult.activeEndpoint = args->endpoint_id;
-    esp_err_t err = matter_controller_is_ready() ? ESP_OK : matter_controller_early_init();
-    if (err == ESP_OK) {
-        err = sendOnOffCommandSync(args->node_id, args->endpoint_id, commandId);
-    }
-    if (err == ESP_OK) {
-        bool state = false;
-        esp_err_t readErr = matter_controller_read_onoff(args->node_id, args->endpoint_id, state);
-        g_postResult.status = MatterPostCommissioningStatus::COMMAND_SUCCESS;
-        g_postResult.error = ESP_OK;
-        g_postResult.errorText = readErr == ESP_OK ? "" : "Commande envoyée; État non relu";
-        g_postResult.commandStateKnown = readErr == ESP_OK;
-        g_postResult.commandState = state;
-        for (auto &item : g_postResult.devices) {
-            if (item.endpoint_id == args->endpoint_id && readErr == ESP_OK) {
-                item.onoff_state_known = true;
-                item.onoff_state = state;
+    for (;;) {
+        CommandWorkerArgs args;
+        if (xQueueReceive(g_commandQueue, &args, portMAX_DELAY) != pdTRUE) continue;
+        if (args.from_ui) {
+            const MatterUiCommand &command = args.ui_command;
+            const uint32_t commandId = command.action == MatterUiAction::SetOn
+                ? chip::app::Clusters::OnOff::Commands::On::Id
+                : command.action == MatterUiAction::SetOff
+                    ? chip::app::Clusters::OnOff::Commands::Off::Id
+                    : chip::app::Clusters::OnOff::Commands::Toggle::Id;
+            char nodeBuf[24];
+            formatMatterId(command.node_id, nodeBuf, sizeof(nodeBuf));
+            ESP_LOGI("CONTROL_MATTER_UI",
+                     "invoke_start node=%s endpoint=%u cluster=0x0006 command=0x%02lx",
+                     nodeBuf, static_cast<unsigned>(command.endpoint_id),
+                     static_cast<unsigned long>(commandId));
+            MatterUiResult result;
+            result.command = command;
+            result.error = matter_controller_is_ready()
+                ? sendOnOffCommandSync(command.node_id, command.endpoint_id, commandId)
+                : ESP_ERR_INVALID_STATE;
+            result.success = result.error == ESP_OK;
+            if (result.success) {
+                ESP_LOGI("CONTROL_MATTER_UI", "invoke_success node=%s endpoint=%u action=%s",
+                         nodeBuf, static_cast<unsigned>(command.endpoint_id),
+                         command.action == MatterUiAction::SetOn ? "on" :
+                         command.action == MatterUiAction::SetOff ? "off" : "toggle");
+            } else {
+                ESP_LOGW("CONTROL_MATTER_UI", "invoke_failed node=%s endpoint=%u error=%s",
+                         nodeBuf, static_cast<unsigned>(command.endpoint_id),
+                         esp_err_to_name(result.error));
             }
+            if (g_uiResultQueue && xQueueSend(g_uiResultQueue, &result, 0) != pdPASS) {
+                ESP_LOGW("CONTROL_MATTER_UI", "result_drop device=%u", static_cast<unsigned>(command.ui_device_id));
+            }
+            continue;
         }
-        (void)saveDeviceCache(g_postResult.devices);
-        ESP_LOGI(TAG, "command_result endpoint=%u result=ok", args->endpoint_id);
-    } else {
-        g_postResult.status = MatterPostCommissioningStatus::COMMAND_FAILED;
-        g_postResult.error = err;
-        g_postResult.errorText = "Commande échouée";
-        ESP_LOGW(TAG, "command_result endpoint=%u result=%s", args->endpoint_id, esp_err_to_name(err));
+        const MatterUiCommand &command = args.ui_command;
+        const uint32_t commandId = command.action == MatterUiAction::SetOn
+            ? chip::app::Clusters::OnOff::Commands::On::Id
+            : chip::app::Clusters::OnOff::Commands::Off::Id;
+        char nodeBuf[24];
+        formatMatterId(command.node_id, nodeBuf, sizeof(nodeBuf));
+        ESP_LOGI(TAG, "%s node_id=%s endpoint=%u",
+                 command.action == MatterUiAction::SetOn ? "command_on" : "command_off",
+                 nodeBuf, static_cast<unsigned>(command.endpoint_id));
+        g_postResult.status = MatterPostCommissioningStatus::COMMAND_IN_PROGRESS;
+        g_postResult.activeEndpoint = command.endpoint_id;
+        esp_err_t err = matter_controller_is_ready() ? ESP_OK : matter_controller_early_init();
+        if (err == ESP_OK) err = sendOnOffCommandSync(command.node_id, command.endpoint_id, commandId);
+        if (err == ESP_OK) {
+            bool state = false;
+            esp_err_t readErr = matter_controller_read_onoff(command.node_id, command.endpoint_id, state);
+            g_postResult.status = MatterPostCommissioningStatus::COMMAND_SUCCESS;
+            g_postResult.error = ESP_OK;
+            g_postResult.errorText = readErr == ESP_OK ? "" : "Commande envoyée; État non relu";
+            g_postResult.commandStateKnown = readErr == ESP_OK;
+            g_postResult.commandState = state;
+            for (auto &item : g_postResult.devices) {
+                if (item.endpoint_id == command.endpoint_id && readErr == ESP_OK) {
+                    item.onoff_state_known = true;
+                    item.onoff_state = state;
+                }
+            }
+            (void)saveDeviceCache(g_postResult.devices);
+            ESP_LOGI(TAG, "command_result endpoint=%u result=ok", command.endpoint_id);
+        } else {
+            g_postResult.status = MatterPostCommissioningStatus::COMMAND_FAILED;
+            g_postResult.error = err;
+            g_postResult.errorText = "Commande échouée";
+            ESP_LOGW(TAG, "command_result endpoint=%u result=%s", command.endpoint_id, esp_err_to_name(err));
+        }
+        ESP_LOGI(TAG, "worker_stack_high_water=%u task=command",
+                 static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
     }
-    ESP_LOGI(TAG, "worker_stack_high_water=%u task=command",
-             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
-    delete args;
-    g_commandTask = nullptr;
-    vTaskDelete(nullptr);
 }
 #endif
 
@@ -2432,6 +2485,77 @@ esp_err_t matter_controller_clear_device_cache() {
 #endif
 }
 
+void matter_controller_log_ui_endpoints(const MatterPostCommissioningResult &result) {
+    char nodeBuf[24];
+    formatMatterId(result.savedNode.node_id, nodeBuf, sizeof(nodeBuf));
+    for (const auto &device : result.devices) {
+        ESP_LOGI("CONTROL_MATTER_UI", "endpoint node=%s endpoint=%u name=\"%s\" onoff=%s",
+                 nodeBuf, static_cast<unsigned>(device.endpoint_id), device.name.c_str(),
+                 device.has_onoff ? "yes" : "no");
+        if (!device.has_onoff) {
+            ESP_LOGI("CONTROL_MATTER_UI", "unsupported_cluster endpoint=%u cluster=0x0006",
+                     static_cast<unsigned>(device.endpoint_id));
+        }
+    }
+}
+
+esp_err_t matter_controller_ui_init() {
+#if CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL && CONFIG_CONTROL_UI_MATTER_COMMANDS
+    if (!matter_controller_is_ready()) return ESP_ERR_INVALID_STATE;
+    MatterSavedNode savedNode;
+    std::string reason;
+    if (matter_saved_state_load_and_validate(savedNode, reason) != MatterSavedState::Valid) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (g_uiResultQueue == nullptr) {
+        g_uiResultQueue = xQueueCreate(COMMAND_QUEUE_LENGTH, sizeof(MatterUiResult));
+        if (!g_uiResultQueue) return ESP_ERR_NO_MEM;
+    }
+    return ensureCommandWorker();
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+esp_err_t matter_controller_ui_enqueue(const MatterUiCommand &command) {
+#if CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL && CONFIG_CONTROL_UI_MATTER_COMMANDS
+    MatterSavedNode savedNode;
+    std::string reason;
+    if (!matter_controller_is_ready() ||
+        matter_saved_state_load_and_validate(savedNode, reason) != MatterSavedState::Valid ||
+        command.node_id == 0 || command.node_id != savedNode.node_id || command.endpoint_id == 0 ||
+        command.ui_device_id == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t initErr = matter_controller_ui_init();
+    if (initErr != ESP_OK) return initErr;
+    CommandWorkerArgs args;
+    args.from_ui = true;
+    args.ui_command = command;
+    if (xQueueSend(g_commandQueue, &args, 0) != pdPASS) return ESP_ERR_TIMEOUT;
+    char nodeBuf[24];
+    formatMatterId(command.node_id, nodeBuf, sizeof(nodeBuf));
+    ESP_LOGI("CONTROL_MATTER_UI", "enqueue node=%s endpoint=%u action=%s device=%u",
+             nodeBuf, static_cast<unsigned>(command.endpoint_id),
+             command.action == MatterUiAction::SetOn ? "on" :
+             command.action == MatterUiAction::SetOff ? "off" : "toggle",
+             static_cast<unsigned>(command.ui_device_id));
+    return ESP_OK;
+#else
+    (void)command;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+bool matter_controller_ui_poll_result(MatterUiResult &out) {
+#if CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL && CONFIG_CONTROL_UI_MATTER_COMMANDS
+    return g_uiResultQueue && xQueueReceive(g_uiResultQueue, &out, 0) == pdTRUE;
+#else
+    (void)out;
+    return false;
+#endif
+}
+
 esp_err_t matter_controller_read_onoff(uint64_t node_id, uint16_t endpoint_id, bool &out_state) {
 #if CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL
     MatterSavedNode savedNode;
@@ -2469,22 +2593,11 @@ esp_err_t matter_controller_send_on(uint64_t node_id, uint16_t endpoint_id) {
         ESP_LOGW(TAG, "command_start_rejected reason=invalid_saved_metadata_or_node_id");
         return ESP_ERR_INVALID_STATE;
     }
-    if (g_commandTask != nullptr) return ESP_ERR_INVALID_STATE;
-    auto *args = new CommandWorkerArgs{node_id, endpoint_id, true};
-    if (!args) return ESP_ERR_NO_MEM;
-    const BaseType_t created = xTaskCreate(
-        matterCommandWorker,
-        "control_matter_cmd",
-        COMMAND_WORKER_STACK_SIZE,
-        args,
-        MATTER_COMMAND_WORKER_PRIORITY,
-        &g_commandTask);
-    if (created != pdPASS) {
-        delete args;
-        g_commandTask = nullptr;
-        return ESP_ERR_NO_MEM;
-    }
-    return ESP_OK;
+    const esp_err_t workerErr = ensureCommandWorker();
+    if (workerErr != ESP_OK) return workerErr;
+    CommandWorkerArgs args;
+    args.ui_command = {node_id, endpoint_id, MatterUiAction::SetOn, 0, 0};
+    return xQueueSend(g_commandQueue, &args, 0) == pdPASS ? ESP_OK : ESP_ERR_TIMEOUT;
 #else
     (void)node_id;
     (void)endpoint_id;
@@ -2501,22 +2614,11 @@ esp_err_t matter_controller_send_off(uint64_t node_id, uint16_t endpoint_id) {
         ESP_LOGW(TAG, "command_start_rejected reason=invalid_saved_metadata_or_node_id");
         return ESP_ERR_INVALID_STATE;
     }
-    if (g_commandTask != nullptr) return ESP_ERR_INVALID_STATE;
-    auto *args = new CommandWorkerArgs{node_id, endpoint_id, false};
-    if (!args) return ESP_ERR_NO_MEM;
-    const BaseType_t created = xTaskCreate(
-        matterCommandWorker,
-        "control_matter_cmd",
-        COMMAND_WORKER_STACK_SIZE,
-        args,
-        MATTER_COMMAND_WORKER_PRIORITY,
-        &g_commandTask);
-    if (created != pdPASS) {
-        delete args;
-        g_commandTask = nullptr;
-        return ESP_ERR_NO_MEM;
-    }
-    return ESP_OK;
+    const esp_err_t workerErr = ensureCommandWorker();
+    if (workerErr != ESP_OK) return workerErr;
+    CommandWorkerArgs args;
+    args.ui_command = {node_id, endpoint_id, MatterUiAction::SetOff, 0, 0};
+    return xQueueSend(g_commandQueue, &args, 0) == pdPASS ? ESP_OK : ESP_ERR_TIMEOUT;
 #else
     (void)node_id;
     (void)endpoint_id;

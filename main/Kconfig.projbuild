@@ -100,6 +100,22 @@ config CONTROL_TOUCH_UI_DISPATCH
         tester. MOVE and RELEASE never request screen redraws. Display refreshes
         remain owned by the app/UI loop and occur only on explicit state changes.
 
+config CONTROL_UI_DASHBOARD_V1
+    bool "Enable local mock home dashboard UI v1"
+    default n
+    help
+        Enables the isolated home dashboard with home, rooms, and room-detail
+        screens. It does not replace the existing commissioning UI.
+
+config CONTROL_UI_MATTER_COMMANDS
+    bool "Connect dashboard light controls to Matter OnOff"
+    depends on CONTROL_UI_DASHBOARD_V1 && CONTROL_MATTER_CONTROLLER
+    default n
+    help
+        Queues dashboard light actions for the existing Matter controller.
+        Endpoints are bound only from the discovered device cache when the
+        configured room/device name match is unambiguous and OnOff is present.
+
 config CONTROL_TOUCH_DEBUG
     bool "Verbose touch movement diagnostics"
     default y
