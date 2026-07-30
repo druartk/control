@@ -88,6 +88,7 @@ bool g_savedNodeLoaded = false;
 MatterSavedState g_savedState = MatterSavedState::None;
 std::string g_savedStateReason;
 MatterPostCommissioningResult g_postResult{};
+MatterDiscoveryResult g_discoveryResult{};
 constexpr uint64_t CONTROL_CONTROLLER_NODE_ID = 112233ULL; // 0x1B669, controller operational node id.
 constexpr uint64_t CONTROL_PRIMARY_REMOTE_NODE_ID = 0x12344321ULL;
 #if CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL
@@ -134,9 +135,12 @@ struct ReadWaitContext {
     uint16_t endpoint_id = 0;
     uint32_t cluster_id = 0;
     uint32_t attribute_id = 0;
-    std::vector<uint16_t> endpoints;
-    std::vector<uint32_t> cluster_ids;
-    std::vector<uint32_t> device_types;
+    std::array<uint16_t, MATTER_DISCOVERY_MAX_ENDPOINTS> endpoints{};
+    size_t endpoint_count = 0;
+    std::array<uint32_t, 64> cluster_ids{};
+    size_t cluster_count = 0;
+    std::array<uint32_t, 16> device_types{};
+    size_t device_type_count = 0;
     bool bool_value = false;
     std::string string_value;
 };
@@ -694,7 +698,9 @@ void readAttributeCallback(uint64_t remoteNodeId, const chip::app::ConcreteDataA
         if (err == CHIP_NO_ERROR) {
             auto iter = list.begin();
             while (iter.Next()) {
-                ctx->endpoints.push_back(iter.GetValue());
+                if (ctx->endpoint_count < ctx->endpoints.size()) {
+                    ctx->endpoints[ctx->endpoint_count++] = iter.GetValue();
+                }
             }
             err = iter.GetStatus();
         }
@@ -705,7 +711,9 @@ void readAttributeCallback(uint64_t remoteNodeId, const chip::app::ConcreteDataA
         if (err == CHIP_NO_ERROR) {
             auto iter = list.begin();
             while (iter.Next()) {
-                ctx->cluster_ids.push_back(iter.GetValue());
+                if (ctx->cluster_count < ctx->cluster_ids.size()) {
+                    ctx->cluster_ids[ctx->cluster_count++] = iter.GetValue();
+                }
             }
             err = iter.GetStatus();
         }
@@ -716,7 +724,9 @@ void readAttributeCallback(uint64_t remoteNodeId, const chip::app::ConcreteDataA
         if (err == CHIP_NO_ERROR) {
             auto iter = list.begin();
             while (iter.Next()) {
-                ctx->device_types.push_back(iter.GetValue().deviceType);
+                if (ctx->device_type_count < ctx->device_types.size()) {
+                    ctx->device_types[ctx->device_type_count++] = iter.GetValue().deviceType;
+                }
             }
             err = iter.GetStatus();
         }
@@ -2058,12 +2068,18 @@ void matterDiscoveryWorker(void *) {
     g_postResult = {};
     g_postResult.status = MatterPostCommissioningStatus::DEVICE_DISCOVERY;
     g_postResult.savedNode = g_savedNode;
+    g_discoveryResult.phase = MatterDiscoveryPhase::CONNECTING;
+    g_discoveryResult.node_id = savedNode.node_id;
+    ESP_LOGI("CONTROL_MATTER_DISCOVERY", "start node=0x%llx",
+             static_cast<unsigned long long>(savedNode.node_id));
 
     if (state != MatterSavedState::Valid) {
+        g_discoveryResult.phase = MatterDiscoveryPhase::FAILED;
         g_postResult.status = state == MatterSavedState::Invalid
             ? MatterPostCommissioningStatus::SAVED_NODE_INVALID
             : MatterPostCommissioningStatus::DISCOVERY_FAILED;
         g_postResult.error = state == MatterSavedState::Invalid ? ESP_ERR_INVALID_STATE : ESP_ERR_NOT_FOUND;
+        g_discoveryResult.error = g_postResult.error;
         g_postResult.errorText = state == MatterSavedState::Invalid
             ? (reason == "remote_node_id_zero" ? "Node ID distant manquant" : "Réinitialisation nécessaire")
             : "Aucun appareil Matter enregistré";
@@ -2084,20 +2100,25 @@ void matterDiscoveryWorker(void *) {
     ESP_LOGI(TAG, "controller_ready=%s", matter_controller_is_ready() ? "yes" : "no");
     esp_err_t err = matter_controller_is_ready() ? ESP_OK : matter_controller_early_init();
     if (err != ESP_OK) {
+        g_discoveryResult.phase = MatterDiscoveryPhase::FAILED;
         g_postResult.status = MatterPostCommissioningStatus::SAVED_NODE_INVALID;
         g_postResult.error = err;
+        g_discoveryResult.error = err;
         g_postResult.errorText = "Matter fabric corrompue";
         g_discoveryTask = nullptr;
         vTaskDelete(nullptr);
         return;
     }
 
+    g_discoveryResult.phase = MatterDiscoveryPhase::READING_ROOT_DESCRIPTOR;
     ReadWaitContext readCtx;
     err = readMatterAttribute(readCtx, savedNode.node_id, 0,
                               chip::app::Clusters::Descriptor::Id,
                               chip::app::Clusters::Descriptor::Attributes::PartsList::Id);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "device_discovery_failed step=parts_list err=%s", esp_err_to_name(err));
+        g_discoveryResult.phase = MatterDiscoveryPhase::FAILED;
+        g_discoveryResult.error = err;
         g_postResult.status = err == ESP_ERR_TIMEOUT ? MatterPostCommissioningStatus::CONNECTION_FAILED
                                                      : MatterPostCommissioningStatus::DISCOVERY_FAILED;
         g_postResult.error = err;
@@ -2109,9 +2130,11 @@ void matterDiscoveryWorker(void *) {
         return;
     }
 
-    for (uint16_t endpoint : readCtx.endpoints) {
+    g_discoveryResult.phase = MatterDiscoveryPhase::READING_ENDPOINTS;
+    for (size_t endpointIndex = 0; endpointIndex < readCtx.endpoint_count; ++endpointIndex) {
+        const uint16_t endpoint = readCtx.endpoints[endpointIndex];
         if (endpoint == 0) continue;
-        ESP_LOGI(TAG, "endpoint_found endpoint=%u", endpoint);
+        ESP_LOGI("CONTROL_MATTER_DISCOVERY", "endpoint=%u descriptor_read_start", endpoint);
         MatterDeviceItem item;
         item.endpoint_id = endpoint;
 
@@ -2119,11 +2142,14 @@ void matterDiscoveryWorker(void *) {
         if (readMatterAttribute(serverCtx, savedNode.node_id, endpoint,
                                 chip::app::Clusters::Descriptor::Id,
                                 chip::app::Clusters::Descriptor::Attributes::ServerList::Id) == ESP_OK) {
-            for (uint32_t clusterId : serverCtx.cluster_ids) {
+            for (size_t clusterIndex = 0; clusterIndex < serverCtx.cluster_count; ++clusterIndex) {
+                const uint32_t clusterId = serverCtx.cluster_ids[clusterIndex];
                 if (clusterId == chip::app::Clusters::OnOff::Id) {
                     item.has_onoff = true;
+                    ESP_LOGI("CONTROL_MATTER_DISCOVERY", "endpoint=%u server_cluster=0x0006", endpoint);
                 } else if (clusterId == chip::app::Clusters::LevelControl::Id) {
                     item.has_level_control = true;
+                    ESP_LOGI("CONTROL_MATTER_DISCOVERY", "endpoint=%u server_cluster=0x0008", endpoint);
                 } else if (clusterId == chip::app::Clusters::ColorControl::Id) {
                     item.has_color_control = true;
                 } else if (clusterId == chip::app::Clusters::Switch::Id) {
@@ -2136,7 +2162,8 @@ void matterDiscoveryWorker(void *) {
         if (readMatterAttribute(typeCtx, savedNode.node_id, endpoint,
                                 chip::app::Clusters::Descriptor::Id,
                                 chip::app::Clusters::Descriptor::Attributes::DeviceTypeList::Id) == ESP_OK) {
-            for (uint32_t deviceType : typeCtx.device_types) {
+            for (size_t typeIndex = 0; typeIndex < typeCtx.device_type_count; ++typeIndex) {
+                const uint32_t deviceType = typeCtx.device_types[typeIndex];
                 if (item.device_type == 0) item.device_type = deviceType;
                 if (isLightDeviceType(deviceType) || isKnownOnOffDeviceType(deviceType)) {
                     item.device_type = deviceType;
@@ -2172,7 +2199,36 @@ void matterDiscoveryWorker(void *) {
         }
 
         item.last_seen_unix_or_boot_counter = timestampNow();
-        (void)tryReadEndpointName(savedNode.node_id, item);
+        if (!tryReadEndpointName(savedNode.node_id, item)) {
+            item.name = "Appareil endpoint " + std::to_string(endpoint);
+        }
+        MatterDiscoveredDevice discovered;
+        discovered.node_id = savedNode.node_id;
+        discovered.endpoint_id = endpoint;
+        copyBounded(discovered.display_name, sizeof(discovered.display_name), item.name);
+        discovered.has_onoff = item.has_onoff;
+        discovered.has_level_control = item.has_level_control;
+        discovered.reachable_known = item.reachable_known;
+        discovered.reachable = item.reachable;
+        discovered.onoff_state_known = item.onoff_state_known;
+        discovered.onoff_state = item.onoff_state;
+        discovered.primary_device_type = item.device_type;
+        discovered.is_aggregator = item.device_type == 0x000E || item.device_type == 0x0016;
+        discovered.is_light_candidate = endpoint != 0 && item.has_onoff && !discovered.is_aggregator &&
+                                        (!item.reachable_known || item.reachable);
+        if (g_discoveryResult.endpoint_count < MATTER_DISCOVERY_MAX_ENDPOINTS) {
+            g_discoveryResult.devices[g_discoveryResult.endpoint_count++] = discovered;
+            if (discovered.is_light_candidate) ++g_discoveryResult.light_count;
+        } else if (!g_discoveryResult.truncated) {
+            g_discoveryResult.truncated = true;
+            ESP_LOGW("CONTROL_MATTER_DISCOVERY", "endpoint_truncated capacity=%u",
+                     static_cast<unsigned>(MATTER_DISCOVERY_MAX_ENDPOINTS));
+        }
+        ESP_LOGI("CONTROL_MATTER_DISCOVERY", "endpoint=%u name=\"%s\"", endpoint, item.name.c_str());
+        ESP_LOGI("CONTROL_MATTER_DISCOVERY", "endpoint=%u type=0x%08lx", endpoint,
+                 static_cast<unsigned long>(item.device_type));
+        ESP_LOGI("CONTROL_MATTER_DISCOVERY", "endpoint=%u light_candidate=%s", endpoint,
+                 discovered.is_light_candidate ? "yes" : "no");
         if (!isMainListVisible(item)) {
             ESP_LOGI(TAG, "endpoint_classified endpoint=%u type=%s has_onoff=%s has_switch=%s name=\"%s\" visible=diagnostic_only",
                      endpoint, item.type_label.c_str(), item.has_onoff ? "yes" : "no",
@@ -2197,6 +2253,11 @@ void matterDiscoveryWorker(void *) {
     g_postResult.error = ESP_OK;
     control_heap_log("after_device_discovery");
     ESP_LOGI(TAG, "discovery_refresh_done count=%u", static_cast<unsigned>(g_postResult.devices.size()));
+    g_discoveryResult.phase = MatterDiscoveryPhase::COMPLETE;
+    g_discoveryResult.error = ESP_OK;
+    ESP_LOGI("CONTROL_MATTER_DISCOVERY", "complete endpoints=%u lights=%u",
+             static_cast<unsigned>(g_discoveryResult.endpoint_count),
+             static_cast<unsigned>(g_discoveryResult.light_count));
     ESP_LOGI(TAG, "worker_stack_high_water=%u task=discovery",
              static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
     g_discoveryTask = nullptr;
@@ -2413,6 +2474,9 @@ esp_err_t matter_controller_start_device_discovery() {
         return ESP_ERR_INVALID_STATE;
     }
     if (g_discoveryTask != nullptr) return ESP_ERR_INVALID_STATE;
+    g_discoveryResult = {};
+    g_discoveryResult.phase = MatterDiscoveryPhase::CONNECTING;
+    g_discoveryResult.node_id = g_savedNode.node_id;
     g_postResult.status = MatterPostCommissioningStatus::DEVICE_DISCOVERY;
     g_postResult.savedNode = g_savedNode;
     const BaseType_t created = xTaskCreate(
@@ -2443,6 +2507,11 @@ esp_err_t matter_controller_get_post_commissioning_result(MatterPostCommissionin
     out = g_postResult;
     out.savedNode = g_savedNode;
     return out.error;
+}
+
+esp_err_t matter_controller_get_discovery_result(MatterDiscoveryResult &out) {
+    out = g_discoveryResult;
+    return ESP_OK;
 }
 
 esp_err_t matter_controller_load_device_cache(MatterPostCommissioningResult &out) {
@@ -2491,6 +2560,21 @@ void matter_controller_log_ui_endpoints(const MatterPostCommissioningResult &res
     for (const auto &device : result.devices) {
         ESP_LOGI("CONTROL_MATTER_UI", "endpoint node=%s endpoint=%u name=\"%s\" onoff=%s",
                  nodeBuf, static_cast<unsigned>(device.endpoint_id), device.name.c_str(),
+                 device.has_onoff ? "yes" : "no");
+        if (!device.has_onoff) {
+            ESP_LOGI("CONTROL_MATTER_UI", "unsupported_cluster endpoint=%u cluster=0x0006",
+                     static_cast<unsigned>(device.endpoint_id));
+        }
+    }
+}
+
+void matter_controller_log_ui_endpoints(const MatterDiscoveryResult &result) {
+    char nodeBuf[24];
+    formatMatterId(result.node_id, nodeBuf, sizeof(nodeBuf));
+    for (size_t i = 0; i < result.endpoint_count; ++i) {
+        const MatterDiscoveredDevice &device = result.devices[i];
+        ESP_LOGI("CONTROL_MATTER_UI", "endpoint node=%s endpoint=%u name=\"%s\" onoff=%s",
+                 nodeBuf, static_cast<unsigned>(device.endpoint_id), device.display_name,
                  device.has_onoff ? "yes" : "no");
         if (!device.has_onoff) {
             ESP_LOGI("CONTROL_MATTER_UI", "unsupported_cluster endpoint=%u cluster=0x0006",

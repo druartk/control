@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
 #include <string>
 #include <vector>
 
@@ -62,6 +63,42 @@ struct MatterDeviceItem {
     uint32_t device_type = 0;
     uint32_t primary_cluster_class = 0;
     uint64_t last_seen_unix_or_boot_counter = 0;
+};
+
+constexpr size_t MATTER_DISCOVERY_MAX_ENDPOINTS = 48;
+
+enum class MatterDiscoveryPhase : uint8_t {
+    IDLE,
+    CONNECTING,
+    READING_ROOT_DESCRIPTOR,
+    READING_ENDPOINTS,
+    COMPLETE,
+    FAILED,
+};
+
+struct MatterDiscoveredDevice {
+    uint64_t node_id = 0;
+    uint16_t endpoint_id = 0;
+    char display_name[48] = {};
+    bool has_onoff = false;
+    bool has_level_control = false;
+    bool reachable = false;
+    bool reachable_known = false;
+    bool onoff_state_known = false;
+    bool onoff_state = false;
+    uint32_t primary_device_type = 0;
+    bool is_aggregator = false;
+    bool is_light_candidate = false;
+};
+
+struct MatterDiscoveryResult {
+    MatterDiscoveryPhase phase = MatterDiscoveryPhase::IDLE;
+    esp_err_t error = ESP_OK;
+    uint64_t node_id = 0;
+    uint16_t endpoint_count = 0;
+    uint16_t light_count = 0;
+    bool truncated = false;
+    std::array<MatterDiscoveredDevice, MATTER_DISCOVERY_MAX_ENDPOINTS> devices{};
 };
 
 enum class MatterSavedState {
@@ -145,9 +182,11 @@ esp_err_t matter_controller_commission_with_manual_code(
 esp_err_t matter_controller_get_last_result(MatterCommissioningResult &out);
 esp_err_t matter_controller_start_device_discovery();
 esp_err_t matter_controller_get_post_commissioning_result(MatterPostCommissioningResult &out);
+esp_err_t matter_controller_get_discovery_result(MatterDiscoveryResult &out);
 esp_err_t matter_controller_load_device_cache(MatterPostCommissioningResult &out);
 esp_err_t matter_controller_clear_device_cache();
 void matter_controller_log_ui_endpoints(const MatterPostCommissioningResult &result);
+void matter_controller_log_ui_endpoints(const MatterDiscoveryResult &result);
 esp_err_t matter_controller_ui_init();
 esp_err_t matter_controller_ui_enqueue(const MatterUiCommand &command);
 bool matter_controller_ui_poll_result(MatterUiResult &out);

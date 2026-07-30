@@ -89,6 +89,7 @@ idf_component_register(
         "matter/matter_controller.cpp"
         "matter/matter_pairing_code.cpp"
         "storage/settings_store.cpp"
+        "storage/ui_config.cpp"
         "matter/matter_onboarding.cpp"
     INCLUDE_DIRS "."
     PRIV_INCLUDE_DIRS ${CONTROL_MAIN_PRIV_INCLUDE_DIRS}

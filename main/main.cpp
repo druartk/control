@@ -21,6 +21,7 @@
 #include "matter/matter_onboarding.h"
 #include "matter/matter_pairing_code.h"
 #include "storage/settings_store.h"
+#include "storage/ui_config.h"
 #include "system/control_heap.h"
 #include "system/control_time.h"
 #include "touch/touch_manager.h"
@@ -222,6 +223,15 @@ public:
                 dashboardAvailable_ = true;
                 controlUi_.init();
                 bindControlUiMatter(cached);
+                UiConfig uiConfig;
+                const esp_err_t configErr = control_ui_config_load(uiConfig);
+                if (configErr == ESP_OK && uiConfig.binding_count != 0) {
+                    controlUi_.bindPersistedDevices(cached.savedNode.node_id, cached.devices, uiConfig);
+                } else {
+#if CONFIG_CONTROL_UI_DEVICE_ONBOARDING
+                    controlUi_.beginOnboarding();
+#endif
+                }
             }
 #endif
             state_ = AppState::WEATHER_HOME;
@@ -245,7 +255,6 @@ public:
     void renderInitialScreen() {
 #if CONFIG_CONTROL_UI_DASHBOARD_V1
         if (dashboardAvailable_ && state_ == AppState::WEATHER_HOME) {
-            controlUi_.showHome();
             renderUi("screen_enter");
         } else
 #endif
@@ -627,6 +636,18 @@ private:
         return;
 #else
         processControlUiMatterResults();
+#if CONFIG_CONTROL_UI_DASHBOARD_V1 && CONFIG_CONTROL_UI_DEVICE_ONBOARDING
+        if (dashboardAvailable_) {
+            MatterDiscoveryResult discovery;
+            if (matter_controller_get_discovery_result(discovery) == ESP_OK &&
+                controlUi_.updateDiscovery(discovery) && state_ == AppState::WEATHER_HOME) {
+                if (discovery.phase == MatterDiscoveryPhase::COMPLETE) {
+                    matter_controller_log_ui_endpoints(discovery);
+                }
+                renderUi("matter_discovery_progress");
+            }
+        }
+#endif
         MatterPostCommissioningResult post;
         (void)matter_controller_get_post_commissioning_result(post);
         if (post.status != lastMatterPostStatus_) {
@@ -641,11 +662,12 @@ private:
 #endif
             switch (post.status) {
                 case MatterPostCommissioningStatus::DEVICE_DISCOVERY:
-                    if (state_ != AppState::MATTER_DEVICE_DISCOVERY) transition(AppState::MATTER_DEVICE_DISCOVERY);
+                    if (!(dashboardAvailable_ && controlUi_.onboardingActive()) &&
+                        state_ != AppState::MATTER_DEVICE_DISCOVERY) transition(AppState::MATTER_DEVICE_DISCOVERY);
                     break;
                 case MatterPostCommissioningStatus::DEVICE_LIST:
                     normalizeMatterSelection();
-                    transition(AppState::MATTER_DEVICE_LIST);
+                    if (!(dashboardAvailable_ && controlUi_.onboardingActive())) transition(AppState::MATTER_DEVICE_LIST);
                     break;
                 case MatterPostCommissioningStatus::COMMAND_IN_PROGRESS:
                     if (batchCommandActive_) {
@@ -667,10 +689,10 @@ private:
                     transition(AppState::MATTER_COMMAND_FAILED);
                     break;
                 case MatterPostCommissioningStatus::CONNECTION_FAILED:
-                    transition(AppState::MATTER_CONNECTION_FAILED);
+                    if (!(dashboardAvailable_ && controlUi_.onboardingActive())) transition(AppState::MATTER_CONNECTION_FAILED);
                     break;
                 case MatterPostCommissioningStatus::DISCOVERY_FAILED:
-                    transition(AppState::MATTER_DISCOVERY_FAILED);
+                    if (!(dashboardAvailable_ && controlUi_.onboardingActive())) transition(AppState::MATTER_DISCOVERY_FAILED);
                     break;
                 case MatterPostCommissioningStatus::SAVED_NODE_INVALID:
                     transition(AppState::MATTER_SAVED_INVALID);
@@ -709,6 +731,14 @@ private:
             (void)matter_controller_load_device_cache(cached);
             matterPostResult_ = cached;
             bindControlUiMatter(cached);
+            UiConfig uiConfig;
+            if (control_ui_config_load(uiConfig) == ESP_OK && uiConfig.binding_count != 0) {
+                controlUi_.bindPersistedDevices(cached.savedNode.node_id, cached.devices, uiConfig);
+            } else {
+#if CONFIG_CONTROL_UI_DEVICE_ONBOARDING
+                controlUi_.beginOnboarding();
+#endif
+            }
             transition(AppState::WEATHER_HOME);
 #else
             transition(AppState::MATTER_COMMISSIONING_SUCCESS);

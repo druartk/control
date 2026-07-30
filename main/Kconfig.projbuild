@@ -116,6 +116,22 @@ config CONTROL_UI_MATTER_COMMANDS
         Endpoints are bound only from the discovered device cache when the
         configured room/device name match is unambiguous and OnOff is present.
 
+config CONTROL_UI_DEVICE_ONBOARDING
+    bool "Enable Matter device onboarding and room binding"
+    depends on CONTROL_UI_DASHBOARD_V1 && CONTROL_MATTER_CONTROLLER
+    default n
+    help
+        Discovers real Matter endpoints, assigns them to rooms, and stores the
+        UI bindings in the separate control_ui NVS namespace.
+
+config CONTROL_UI_MOCK_DEVICES
+    bool "Enable dashboard mock devices"
+    depends on CONTROL_UI_DASHBOARD_V1
+    default n
+    help
+        Development-only dashboard fixtures. Matter stable builds keep this
+        disabled so missing bindings never look like real devices.
+
 config CONTROL_TOUCH_DEBUG
     bool "Verbose touch movement diagnostics"
     default y
