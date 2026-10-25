@@ -17,7 +17,7 @@ idf_component_register(
         "${EPD_SRC}/zlib/uncompr.c"
         "${EPD_SRC}/zlib/zutil.c"
     INCLUDE_DIRS "${EPD_SRC}" "${EPD_SRC}/zlib"
-    REQUIRES control_board esp_lcd esp_driver_rmt driver)
+    REQUIRES control_board esp_lcd driver)
 
 target_compile_options(${COMPONENT_LIB} PRIVATE
     -Wno-unused-function -Wno-unused-variable -Wno-attributes

@@ -119,6 +119,8 @@ volatile uint8_t IRAM_ATTR *i2s_get_current_buffer()
 #else
 volatile uint8_t IRAM_ATTR *i2s_get_current_buffer()
 {
+    // The LCD backend has one buffer; DMA must finish before it is overwritten.
+    while (!output_done) ;
     return buffer;
 }
 #endif

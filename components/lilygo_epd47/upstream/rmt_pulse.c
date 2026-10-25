@@ -4,35 +4,19 @@
 /******************************************************************************/
 
 #include "rmt_pulse.h"
-#include <esp_idf_version.h>
 
-#if ESP_IDF_VERSION_MAJOR >= 5 // IDF 5+ — new RMT TX driver (driver_ng)
-#include <driver/rmt_tx.h>
-#include <driver/rmt_encoder.h>
-#include <freertos/FreeRTOS.h>  // portMAX_DELAY
-#else
 #include <driver/rmt.h>
-#endif
-
-#include <esp_log.h>
+#include <hal/rmt_ll.h>
+#include <soc/rmt_struct.h>
 
 /******************************************************************************/
 /***        local variables                                                 ***/
 /******************************************************************************/
 
-#if ESP_IDF_VERSION_MAJOR >= 5
-
-static rmt_channel_handle_t rmt_chan = NULL;
-static rmt_encoder_handle_t copy_encoder = NULL;
-
-#else
-
 /**
  * @brief the RMT channel configuration object
  */
 static rmt_config_t row_rmt_config;
-
-#endif
 
 /******************************************************************************/
 /***        exported functions                                              ***/
@@ -40,37 +24,6 @@ static rmt_config_t row_rmt_config;
 
 esp_err_t rmt_pulse_init(gpio_num_t pin)
 {
-#if ESP_IDF_VERSION_MAJOR >= 5
-    rmt_tx_channel_config_t tx_chan_config = {
-        .clk_src = RMT_CLK_SRC_DEFAULT,
-        .gpio_num = pin,
-        .mem_block_symbols = 64,
-        // 10 MHz -> 0.1 us resolution (same as legacy clk_div=8 on 80MHz APB)
-        .resolution_hz = 10 * 1000 * 1000,
-        .trans_queue_depth = 4,
-        .flags.invert_out = false,
-        .flags.with_dma = false,
-    };
-    esp_err_t err = rmt_new_tx_channel(&tx_chan_config, &rmt_chan);
-    if (err != ESP_OK) return err;
-
-    rmt_copy_encoder_config_t copy_encoder_config = {};
-    err = rmt_new_copy_encoder(&copy_encoder_config, &copy_encoder);
-    if (err != ESP_OK) {
-        rmt_del_channel(rmt_chan);
-        rmt_chan = NULL;
-        return err;
-    }
-
-    err = rmt_enable(rmt_chan);
-    if (err != ESP_OK) {
-        rmt_del_encoder(copy_encoder);
-        rmt_del_channel(rmt_chan);
-        copy_encoder = NULL;
-        rmt_chan = NULL;
-        return err;
-    }
-#else
     row_rmt_config.rmt_mode = RMT_MODE_TX;
     // currently hardcoded: use channel 1
     row_rmt_config.channel = RMT_CHANNEL_1;
@@ -87,39 +40,46 @@ esp_err_t rmt_pulse_init(gpio_num_t pin)
     row_rmt_config.tx_config.idle_level = RMT_IDLE_LEVEL_LOW;
     row_rmt_config.tx_config.idle_output_en = true;
 
-    rmt_config(&row_rmt_config);
-    rmt_driver_install(RMT_CHANNEL_1, 0, 0);
-#endif
-    return ESP_OK;
+    esp_err_t err = rmt_config(&row_rmt_config);
+    if (err != ESP_OK) return err;
+    return rmt_driver_install(row_rmt_config.channel, 0, 0);
 }
 
+void IRAM_ATTR pulse_ckv_wait()
+{
+    ESP_ERROR_CHECK(rmt_wait_tx_done(row_rmt_config.channel, portMAX_DELAY));
+}
+
+void pulse_ckv_prepare_frame_start()
+{
+    pulse_ckv_wait();
+    rmt_item32_t items[2] = {0};
+    items[0].level0 = 1;
+    items[0].duration0 = 100;
+    items[0].duration1 = 100;
+    // This pulse is polled; the legacy driver's semaphore remains idle.
+    ESP_ERROR_CHECK(rmt_set_tx_intr_en(row_rmt_config.channel, false));
+    ESP_ERROR_CHECK(rmt_fill_tx_items(row_rmt_config.channel, items, 2, 0));
+}
+
+void IRAM_ATTR pulse_ckv_start_frame()
+{
+    rmt_ll_tx_reset_pointer(&RMT, row_rmt_config.channel);
+    rmt_ll_clear_interrupt_status(&RMT, RMT_LL_EVENT_TX_DONE(row_rmt_config.channel));
+    rmt_ll_tx_start(&RMT, row_rmt_config.channel);
+}
+
+void IRAM_ATTR pulse_ckv_finish_frame_start()
+{
+    const uint32_t done = RMT_LL_EVENT_TX_DONE(row_rmt_config.channel);
+    while (!(rmt_ll_tx_get_interrupt_status_raw(&RMT, row_rmt_config.channel) & done)) ;
+    rmt_ll_clear_interrupt_status(&RMT, done);
+}
 
 void IRAM_ATTR pulse_ckv_ticks(uint16_t high_time_ticks,
                                uint16_t low_time_ticks, bool wait)
 {
-#if ESP_IDF_VERSION_MAJOR >= 5
-    rmt_symbol_word_t symbol;
-    if (high_time_ticks > 0) {
-        symbol.level0    = 1;
-        symbol.duration0 = high_time_ticks;
-        symbol.level1    = 0;
-        symbol.duration1 = low_time_ticks > 0 ? low_time_ticks : 1;
-    } else {
-        symbol.level0    = 1;
-        symbol.duration0 = low_time_ticks;
-        symbol.level1    = 0;
-        symbol.duration1 = 1;
-    }
-
-    rmt_transmit_config_t tx_config = {
-        .loop_count = 0,
-    };
-    rmt_transmit(rmt_chan, copy_encoder, &symbol, sizeof(symbol), &tx_config);
-    if (wait) {
-        rmt_tx_wait_all_done(rmt_chan, portMAX_DELAY);
-    }
-#else
-    rmt_item32_t rmt_mem_ptr;
+    rmt_item32_t rmt_mem_ptr = {0};
     if (high_time_ticks > 0)
     {
         rmt_mem_ptr.level0 = 1;
@@ -134,10 +94,9 @@ void IRAM_ATTR pulse_ckv_ticks(uint16_t high_time_ticks,
         rmt_mem_ptr.level1 = 0;
         rmt_mem_ptr.duration1 = 0;
     }
-    rmt_write_items(row_rmt_config.channel, &rmt_mem_ptr, 1, wait);
-#endif
+    // The factory API copies the symbol and starts CKV before returning.
+    ESP_ERROR_CHECK(rmt_write_items(row_rmt_config.channel, &rmt_mem_ptr, 1, wait));
 }
-
 
 void IRAM_ATTR pulse_ckv_us(uint16_t high_time_us, uint16_t low_time_us, bool wait)
 {

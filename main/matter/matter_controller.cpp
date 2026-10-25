@@ -16,16 +16,19 @@
 #include "sdkconfig.h"
 #include "system/control_heap.h"
 #include "system/control_time.h"
+#include "storage/ui_config.h"
 
 #include <cstdio>
 
 #if CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL
 #include <algorithm>
+#include <map>
 #include <optional>
 #include <vector>
 #include <cstring>
 #include <lwip/ip_addr.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include <app/data-model/Decode.h>
@@ -35,11 +38,17 @@
 #include <clusters/BridgedDeviceBasicInformation/ClusterId.h>
 #include <clusters/ColorControl/ClusterId.h>
 #include <clusters/Descriptor/Attributes.h>
+#include <clusters/LevelControl/Attributes.h>
 #include <clusters/LevelControl/ClusterId.h>
+#include <clusters/LevelControl/CommandIds.h>
 #include <clusters/OnOff/Attributes.h>
 #include <clusters/OnOff/ClusterId.h>
 #include <clusters/OnOff/CommandIds.h>
 #include <clusters/Switch/ClusterId.h>
+#include <clusters/UserLabel/Attributes.h>
+#include <clusters/UserLabel/ClusterId.h>
+#include <clusters/FixedLabel/Attributes.h>
+#include <clusters/FixedLabel/ClusterId.h>
 #include <esp_matter.h>
 #include <esp_matter_attestation_trust_store.h>
 #include <esp_matter_controller_client.h>
@@ -56,10 +65,15 @@
 #include <setup_payload/SetupPayload.h>
 #endif
 
+#if CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL
+void servicePendingUiCommands();
+#endif
+
 namespace {
 constexpr const char *TAG = "CONTROL_MATTER";
 constexpr const char *MATTER_APP_NVS_NAMESPACE = "control_matter";
-constexpr const char *MATTER_DEVICE_CACHE_NVS_NAMESPACE = "control_matter_devices";
+// NVS namespaces are limited to 15 characters.
+constexpr const char *MATTER_DEVICE_CACHE_NVS_NAMESPACE = "ctrl_matter_dev";
 constexpr const char *KEY_COMMISSIONED = "commissioned";
 constexpr const char *KEY_NODE_ID = "node_id";
 constexpr const char *KEY_FABRIC_INDEX = "fabric_idx";
@@ -76,7 +90,7 @@ constexpr const char *KEY_DEVICE_CACHE_BLOB = "devices";
 constexpr size_t MIN_CONTROLLER_LARGEST_INTERNAL_HEAP = 40 * 1024;
 constexpr uint32_t DEVICE_CACHE_MAGIC = 0x434D4431; // "CMD1"
 constexpr uint16_t DEVICE_CACHE_VERSION = 1;
-constexpr size_t DEVICE_CACHE_MAX_ITEMS = 32;
+constexpr size_t DEVICE_CACHE_SAFETY_LIMIT = MATTER_DISCOVERY_SAFETY_LIMIT;
 constexpr size_t DEVICE_CACHE_NAME_LEN = 48;
 constexpr uint8_t COMMISSIONING_MODE_FIRST_PAIRING = 1;
 constexpr uint8_t COMMISSIONING_MODE_MULTI_ADMIN = 2;
@@ -108,11 +122,13 @@ std::string g_lastMdnsPrescanAddr;
 std::string g_lastMdnsPrescanHost;
 constexpr uint64_t CONTROL_CONTROLLER_FABRIC_ID = 1ULL;
 constexpr uint16_t CONTROL_CONTROLLER_LISTEN_PORT = 5580;
-constexpr uint32_t DISCOVERY_WORKER_STACK_SIZE = 16384;
-constexpr uint32_t COMMAND_WORKER_STACK_SIZE = 12288;
-constexpr size_t COMMAND_QUEUE_LENGTH = 8;
-constexpr UBaseType_t MATTER_DISCOVERY_WORKER_PRIORITY = 7;
-constexpr UBaseType_t MATTER_COMMAND_WORKER_PRIORITY = 7;
+// Discovery can now service a command and its readback between attribute reads.
+constexpr uint32_t COMMAND_WORKER_STACK_SIZE = 8192;
+// Reserve room for every configured light plus a queued discovery request.
+constexpr size_t COMMAND_QUEUE_LENGTH = CONTROL_UI_CONFIG_MAX_BINDINGS + 1;
+constexpr UBaseType_t MATTER_OBJECT_MEMORY_CAPS = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+constexpr UBaseType_t MATTER_TASK_MEMORY_CAPS = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+constexpr UBaseType_t MATTER_COMMAND_WORKER_PRIORITY = 2;
 constexpr uint64_t CONTROL_FABRIC_CONFLICT_REMOTE_NODE_ID = 0x12344322ULL;
 constexpr uint32_t CHIP_ERROR_NOC_RESPONSE_STATUS = 0x7E;
 constexpr const char *MATTER_KVS_NVS_NAMESPACE = "CHIP_KVS";
@@ -126,6 +142,11 @@ TaskHandle_t g_discoveryTask = nullptr;
 TaskHandle_t g_commandTask = nullptr;
 QueueHandle_t g_commandQueue = nullptr;
 QueueHandle_t g_uiResultQueue = nullptr;
+std::map<uint16_t, bool> g_scanOnOffStates;
+uint32_t g_nextScanId = 0;
+int64_t g_scanStartedUs = 0;
+size_t g_scanHeapFreeBefore = 0;
+size_t g_scanPsramFreeBefore = 0;
 
 struct ReadWaitContext {
     SemaphoreHandle_t done = nullptr;
@@ -135,14 +156,17 @@ struct ReadWaitContext {
     uint16_t endpoint_id = 0;
     uint32_t cluster_id = 0;
     uint32_t attribute_id = 0;
-    std::array<uint16_t, MATTER_DISCOVERY_MAX_ENDPOINTS> endpoints{};
+    std::vector<uint16_t> endpoints;
     size_t endpoint_count = 0;
+    bool endpoint_limit_reached = false;
     std::array<uint32_t, 64> cluster_ids{};
     size_t cluster_count = 0;
     std::array<uint32_t, 16> device_types{};
     size_t device_type_count = 0;
     bool bool_value = false;
+    uint8_t level_value = 0;
     std::string string_value;
+    std::string string_label;
 };
 
 struct DeviceCacheHeader {
@@ -181,11 +205,27 @@ struct CommandWaitContext {
 
 struct CommandWorkerArgs {
     bool from_ui = false;
+    bool discovery = false;
     MatterUiCommand ui_command;
 };
 
 ReadWaitContext *g_activeRead = nullptr;
 CommandWaitContext *g_activeCommand = nullptr;
+
+void logDiscoveryComplete() {
+    g_discoveryResult.duration_ms = g_scanStartedUs > 0
+        ? static_cast<uint32_t>((esp_timer_get_time() - g_scanStartedUs) / 1000)
+        : 0;
+    ESP_LOGI(TAG, "discovered_endpoint_count=%u discovered_device_count=%u scan_complete",
+             static_cast<unsigned>(g_discoveryResult.endpoint_count),
+             static_cast<unsigned>(g_postResult.devices.size()));
+    ESP_LOGI(TAG, "scan_duration_ms=%u", static_cast<unsigned>(g_discoveryResult.duration_ms));
+    ESP_LOGI(TAG, "heap_free_before=%u", static_cast<unsigned>(g_scanHeapFreeBefore));
+    ESP_LOGI(TAG, "heap_free_after=%u", static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
+    ESP_LOGI(TAG, "psram_free_before=%u", static_cast<unsigned>(g_scanPsramFreeBefore));
+    ESP_LOGI(TAG, "psram_free_after=%u", static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+    ESP_LOGI(TAG, "device_count=%u", static_cast<unsigned>(g_postResult.devices.size()));
+}
 #endif
 
 [[maybe_unused]] const char *safeText(const std::string &value) {
@@ -597,9 +637,14 @@ bool isKnownOnOffDeviceType(uint32_t deviceType) {
     }
 }
 
+bool isPlugDeviceType(uint32_t deviceType) {
+    return deviceType == 0x010A || deviceType == 0x010B;
+}
+
 const char *fallbackTypeLabel(const MatterDeviceItem &item) {
     if (item.has_switch && !item.has_onoff) return "Interrupteur";
     if (item.has_onoff && isLightDeviceType(item.device_type)) return "Lumière";
+    if (item.has_onoff && isPlugDeviceType(item.device_type)) return "Prise";
     if (item.has_color_control) return "Lumière";
     if (item.has_level_control && item.has_onoff) return isLightDeviceType(item.device_type) ? "Lumière" : "Appareil On/Off";
     if (item.has_onoff) return "Appareil On/Off";
@@ -612,6 +657,10 @@ std::string fallbackDeviceName(const MatterDeviceItem &item) {
 
 bool isMainListVisible(const MatterDeviceItem &item) {
     return item.has_onoff || item.has_switch;
+}
+
+bool isControlLight(const MatterDeviceItem &item) {
+    return item.endpoint_id != 0 && item.has_onoff && !item.has_switch;
 }
 
 uint64_t timestampNow() {
@@ -698,9 +747,16 @@ void readAttributeCallback(uint64_t remoteNodeId, const chip::app::ConcreteDataA
         if (err == CHIP_NO_ERROR) {
             auto iter = list.begin();
             while (iter.Next()) {
-                if (ctx->endpoint_count < ctx->endpoints.size()) {
-                    ctx->endpoints[ctx->endpoint_count++] = iter.GetValue();
+                const uint16_t endpoint = iter.GetValue();
+                if (std::find(ctx->endpoints.begin(), ctx->endpoints.end(), endpoint) != ctx->endpoints.end()) {
+                    continue;
                 }
+                if (ctx->endpoints.size() >= MATTER_DISCOVERY_SAFETY_LIMIT) {
+                    ctx->endpoint_limit_reached = true;
+                    continue;
+                }
+                ctx->endpoints.push_back(endpoint);
+                ctx->endpoint_count = ctx->endpoints.size();
             }
             err = iter.GetStatus();
         }
@@ -730,9 +786,14 @@ void readAttributeCallback(uint64_t remoteNodeId, const chip::app::ConcreteDataA
             }
             err = iter.GetStatus();
         }
-    } else if (path.mClusterId == OnOff::Id &&
-               path.mAttributeId == OnOff::Attributes::OnOff::Id) {
+    } else if ((path.mClusterId == OnOff::Id &&
+                path.mAttributeId == OnOff::Attributes::OnOff::Id) ||
+               (path.mClusterId == BridgedDeviceBasicInformation::Id &&
+                path.mAttributeId == BridgedDeviceBasicInformation::Attributes::Reachable::Id)) {
         err = chip::app::DataModel::Decode(*data, ctx->bool_value);
+    } else if (path.mClusterId == LevelControl::Id &&
+               path.mAttributeId == LevelControl::Attributes::CurrentLevel::Id) {
+        err = chip::app::DataModel::Decode(*data, ctx->level_value);
     } else if ((path.mClusterId == BasicInformation::Id &&
                 (path.mAttributeId == BasicInformation::Attributes::NodeLabel::Id ||
                  path.mAttributeId == BasicInformation::Attributes::ProductName::Id ||
@@ -747,6 +808,44 @@ void readAttributeCallback(uint64_t remoteNodeId, const chip::app::ConcreteDataA
         err = chip::app::DataModel::Decode(*data, value);
         if (err == CHIP_NO_ERROR && value.data() && value.size() > 0) {
             ctx->string_value.assign(value.data(), value.size());
+        }
+    } else if (path.mClusterId == UserLabel::Id &&
+               path.mAttributeId == UserLabel::Attributes::LabelList::Id) {
+        UserLabel::Attributes::LabelList::TypeInfo::DecodableType list;
+        err = chip::app::DataModel::Decode(*data, list);
+        if (err == CHIP_NO_ERROR) {
+            auto iter = list.begin();
+            while (iter.Next()) {
+                const auto &entry = iter.GetValue();
+                if (!entry.value.data() || entry.value.size() == 0) continue;
+                std::string label(entry.label.data() ? entry.label.data() : "", entry.label.size());
+                std::string value(entry.value.data(), entry.value.size());
+                if (ctx->string_value.empty() || label == "name" || label == "Name") {
+                    ctx->string_label = std::move(label);
+                    ctx->string_value = std::move(value);
+                    if (ctx->string_label == "name" || ctx->string_label == "Name") break;
+                }
+            }
+            err = iter.GetStatus();
+        }
+    } else if (path.mClusterId == FixedLabel::Id &&
+               path.mAttributeId == FixedLabel::Attributes::LabelList::Id) {
+        FixedLabel::Attributes::LabelList::TypeInfo::DecodableType list;
+        err = chip::app::DataModel::Decode(*data, list);
+        if (err == CHIP_NO_ERROR) {
+            auto iter = list.begin();
+            while (iter.Next()) {
+                const auto &entry = iter.GetValue();
+                if (!entry.value.data() || entry.value.size() == 0) continue;
+                std::string label(entry.label.data() ? entry.label.data() : "", entry.label.size());
+                std::string value(entry.value.data(), entry.value.size());
+                if (ctx->string_value.empty() || label == "name" || label == "Name") {
+                    ctx->string_label = std::move(label);
+                    ctx->string_value = std::move(value);
+                    if (ctx->string_label == "name" || ctx->string_label == "Name") break;
+                }
+            }
+            err = iter.GetStatus();
         }
     } else {
         err = CHIP_ERROR_INVALID_ARGUMENT;
@@ -765,7 +864,12 @@ void readDoneCallback(uint64_t remoteNodeId,
 
 esp_err_t readMatterAttribute(ReadWaitContext &ctx, uint64_t nodeId, uint16_t endpointId,
                               uint32_t clusterId, uint32_t attributeId, uint32_t timeoutMs = 10000) {
+    servicePendingUiCommands();
     ctx = {};
+    if (clusterId == chip::app::Clusters::Descriptor::Id &&
+        attributeId == chip::app::Clusters::Descriptor::Attributes::PartsList::Id) {
+        ctx.endpoints.reserve(64);
+    }
     ctx.done = xSemaphoreCreateBinary();
     if (!ctx.done) return ESP_ERR_NO_MEM;
     ctx.chip_error = CHIP_ERROR_TIMEOUT;
@@ -809,6 +913,7 @@ esp_err_t readMatterAttribute(ReadWaitContext &ctx, uint64_t nodeId, uint16_t en
     g_activeRead = nullptr;
     vSemaphoreDelete(ctx.done);
     ctx.done = nullptr;
+    if (ctx.endpoint_limit_reached) return ESP_ERR_INVALID_SIZE;
     if (!ctx.got_value) return ESP_FAIL;
     return ctx.chip_error == CHIP_NO_ERROR ? ESP_OK : ESP_FAIL;
 }
@@ -836,6 +941,12 @@ bool tryReadEndpointName(uint64_t nodeId, MatterDeviceItem &item) {
         { chip::app::Clusters::BasicInformation::Id,
           chip::app::Clusters::BasicInformation::Attributes::NodeLabel::Id,
           "basic_node_label" },
+        { chip::app::Clusters::UserLabel::Id,
+          chip::app::Clusters::UserLabel::Attributes::LabelList::Id,
+          "user_label" },
+        { chip::app::Clusters::FixedLabel::Id,
+          chip::app::Clusters::FixedLabel::Attributes::LabelList::Id,
+          "fixed_label" },
         { chip::app::Clusters::BridgedDeviceBasicInformation::Id,
           chip::app::Clusters::BridgedDeviceBasicInformation::Attributes::ProductName::Id,
           "bridged_product_name" },
@@ -848,12 +959,14 @@ bool tryReadEndpointName(uint64_t nodeId, MatterDeviceItem &item) {
         if (readMatterStringAttribute(nodeId, item.endpoint_id, attempt.cluster, attempt.attribute, name) == ESP_OK &&
             !name.empty()) {
             item.name = name;
+            item.name_source = attempt.source;
             ESP_LOGI(TAG, "read_endpoint_name endpoint=%u source=%s name=\"%s\"",
                      item.endpoint_id, attempt.source, item.name.c_str());
             return true;
         }
     }
     item.name = fallbackDeviceName(item);
+    item.name_source = "endpoint_fallback";
     ESP_LOGI(TAG, "read_endpoint_name endpoint=%u source=fallback name=\"%s\"",
              item.endpoint_id, item.name.c_str());
     return false;
@@ -874,8 +987,39 @@ MatterDeviceItem recordToDevice(const DeviceCacheRecord &rec) {
     item.primary_cluster_class = rec.primary_cluster_class;
     item.last_seen_unix_or_boot_counter = rec.last_seen;
     item.name = boundedString(rec.display_name, sizeof(rec.display_name));
+    item.name_source = item.name.empty() ? "" : "cache";
     item.type_label = boundedString(rec.type_label, sizeof(rec.type_label));
     return item;
+}
+
+bool isGeneratedDeviceName(const MatterDeviceItem &item) {
+    return item.name.empty() || item.name == fallbackDeviceName(item) ||
+           item.name == "Appareil endpoint " + std::to_string(item.endpoint_id);
+}
+
+void preserveKnownDevices(std::vector<MatterDeviceItem> &current,
+                          const std::vector<MatterDeviceItem> &previous) {
+    for (const MatterDeviceItem &old : previous) {
+        auto found = std::find_if(current.begin(), current.end(), [&](const MatterDeviceItem &item) {
+            return item.endpoint_id == old.endpoint_id;
+        });
+        if (found == current.end()) {
+            MatterDeviceItem stale = old;
+            stale.reachable_known = true;
+            stale.reachable = false;
+            stale.name_source = old.name_source.empty() ? "cache" : old.name_source;
+            current.push_back(std::move(stale));
+            ESP_LOGI(TAG, "known_device_preserved endpoint=%u reachable=no source=cache",
+                     static_cast<unsigned>(old.endpoint_id));
+            continue;
+        }
+        if (isGeneratedDeviceName(*found) && !old.name.empty() && !isGeneratedDeviceName(old)) {
+            found->name = old.name;
+            found->name_source = "cache";
+            ESP_LOGI(TAG, "read_endpoint_name endpoint=%u source=cache name=\"%s\"",
+                     static_cast<unsigned>(found->endpoint_id), found->name.c_str());
+        }
+    }
 }
 
 DeviceCacheRecord deviceToRecord(const MatterDeviceItem &item) {
@@ -899,7 +1043,12 @@ DeviceCacheRecord deviceToRecord(const MatterDeviceItem &item) {
 }
 
 esp_err_t saveDeviceCache(const std::vector<MatterDeviceItem> &devices) {
-    const size_t count = std::min(devices.size(), DEVICE_CACHE_MAX_ITEMS);
+    if (devices.size() > DEVICE_CACHE_SAFETY_LIMIT) {
+        ESP_LOGE(TAG, "ERROR: device_cache_add_failed node=unknown endpoint=0 discovered_so_far=%u",
+                 static_cast<unsigned>(devices.size()));
+        return ESP_ERR_INVALID_SIZE;
+    }
+    const size_t count = devices.size();
     std::vector<uint8_t> blob(sizeof(DeviceCacheHeader) + count * sizeof(DeviceCacheRecord));
     auto *header = reinterpret_cast<DeviceCacheHeader *>(blob.data());
     header->magic = DEVICE_CACHE_MAGIC;
@@ -940,9 +1089,26 @@ esp_err_t loadDeviceCache(std::vector<MatterDeviceItem> &devices) {
             const auto *header = reinterpret_cast<const DeviceCacheHeader *>(blob.data());
             if (header->magic == DEVICE_CACHE_MAGIC && header->version == DEVICE_CACHE_VERSION) {
                 const size_t available = (size - sizeof(DeviceCacheHeader)) / sizeof(DeviceCacheRecord);
-                const size_t count = std::min<size_t>(header->count, std::min(available, DEVICE_CACHE_MAX_ITEMS));
-                const auto *records = reinterpret_cast<const DeviceCacheRecord *>(blob.data() + sizeof(DeviceCacheHeader));
-                for (size_t i = 0; i < count; ++i) devices.push_back(recordToDevice(records[i]));
+                if (header->count > DEVICE_CACHE_SAFETY_LIMIT || header->count > available) {
+                    err = ESP_ERR_INVALID_SIZE;
+                } else {
+                    const auto *records = reinterpret_cast<const DeviceCacheRecord *>(blob.data() + sizeof(DeviceCacheHeader));
+                    size_t duplicateCount = 0;
+                    for (size_t i = 0; i < header->count; ++i) {
+                        MatterDeviceItem item = recordToDevice(records[i]);
+                        if (std::find_if(devices.begin(), devices.end(), [&](const MatterDeviceItem &known) {
+                                return known.endpoint_id == item.endpoint_id;
+                            }) != devices.end()) {
+                            ++duplicateCount;
+                            continue;
+                        }
+                        devices.push_back(std::move(item));
+                    }
+                    if (duplicateCount) {
+                        ESP_LOGW(TAG, "device_cache_duplicates_removed count=%u",
+                                 static_cast<unsigned>(duplicateCount));
+                    }
+                }
             } else {
                 err = ESP_ERR_INVALID_VERSION;
             }
@@ -973,7 +1139,9 @@ void commandErrorCallback(void *, CHIP_ERROR error) {
     if (ctx->done) xSemaphoreGive(ctx->done);
 }
 
-esp_err_t sendOnOffCommandSync(uint64_t nodeId, uint16_t endpointId, uint32_t commandId, uint32_t timeoutMs = 10000) {
+esp_err_t sendClusterCommandSync(uint64_t nodeId, uint16_t endpointId, uint32_t clusterId, uint32_t commandId,
+                                 const char *payload = nullptr, uint32_t timeoutMs = 10000,
+                                 CHIP_ERROR *chipErrorOut = nullptr) {
     CommandWaitContext ctx{};
     ctx.done = xSemaphoreCreateBinary();
     if (!ctx.done) return ESP_ERR_NO_MEM;
@@ -982,7 +1150,7 @@ esp_err_t sendOnOffCommandSync(uint64_t nodeId, uint16_t endpointId, uint32_t co
     g_activeCommand = &ctx;
 
     auto *cmd = chip::Platform::New<esp_matter::controller::cluster_command>(
-        nodeId, endpointId, chip::app::Clusters::OnOff::Id, commandId, nullptr,
+        nodeId, endpointId, clusterId, commandId, payload,
         chip::NullOptional, commandSuccessCallback, commandErrorCallback);
     if (!cmd) {
         g_activeCommand = nullptr;
@@ -997,16 +1165,34 @@ esp_err_t sendOnOffCommandSync(uint64_t nodeId, uint16_t endpointId, uint32_t co
     if (err != ESP_OK) {
         g_activeCommand = nullptr;
         vSemaphoreDelete(ctx.done);
+        if (chipErrorOut) *chipErrorOut = ctx.chip_error;
         return err;
     }
     if (xSemaphoreTake(ctx.done, pdMS_TO_TICKS(timeoutMs)) != pdTRUE) {
         g_activeCommand = nullptr;
         vSemaphoreDelete(ctx.done);
+        if (chipErrorOut) *chipErrorOut = ctx.chip_error;
         return ESP_ERR_TIMEOUT;
     }
     g_activeCommand = nullptr;
     vSemaphoreDelete(ctx.done);
+    if (chipErrorOut) *chipErrorOut = ctx.chip_error;
     return ctx.chip_error == CHIP_NO_ERROR ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t sendOnOffCommandSync(uint64_t nodeId, uint16_t endpointId, uint32_t commandId, uint32_t timeoutMs = 10000,
+                               CHIP_ERROR *chipErrorOut = nullptr) {
+    return sendClusterCommandSync(nodeId, endpointId, chip::app::Clusters::OnOff::Id, commandId, nullptr, timeoutMs, chipErrorOut);
+}
+
+esp_err_t sendLevelCommandSync(uint64_t nodeId, uint16_t endpointId, uint8_t level, uint32_t timeoutMs = 10000,
+                               CHIP_ERROR *chipErrorOut = nullptr) {
+    char payload[96];
+    snprintf(payload, sizeof(payload), "{\"level\":%u,\"transitionTime\":0,\"optionsMask\":0}",
+             static_cast<unsigned>(level));
+    return sendClusterCommandSync(nodeId, endpointId, chip::app::Clusters::LevelControl::Id,
+                                  chip::app::Clusters::LevelControl::Commands::MoveToLevel::Id,
+                                  payload, timeoutMs, chipErrorOut);
 }
 
 const char *attestationResultName(chip::Credentials::AttestationVerificationResult result) {
@@ -1354,6 +1540,8 @@ void dumpLocalStorageSummaryLocked() {
 #endif
 }
 
+esp_err_t ensureCommandWorker();
+
 const char *matter_commissioning_status_name(MatterCommissioningStatus status) {
     switch (status) {
         case MatterCommissioningStatus::IDLE: return "IDLE";
@@ -1541,6 +1729,11 @@ esp_err_t matter_controller_start_platform() {
              static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
     ESP_LOGI("CONTROL_TASKS", "main_stack_high_water before_esp_matter_start=%u",
              static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+    const esp_err_t workerErr = ensureCommandWorker();
+    if (workerErr != ESP_OK) {
+        ESP_LOGE(TAG, "command_worker_start_failed err=%s", esp_err_to_name(workerErr));
+        return workerErr;
+    }
     g_matterStartInProgress = true;
     err = esp_matter::start(matter_app_event_cb);
     g_matterStartInProgress = false;
@@ -2059,21 +2252,36 @@ esp_err_t matter_controller_reset_controller_init_failure() {
 }
 
 #if CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL
-void matterDiscoveryWorker(void *) {
-    ESP_LOGI(TAG, "worker_stack_size=%u task=discovery", static_cast<unsigned>(DISCOVERY_WORKER_STACK_SIZE));
+void matterDiscoveryRun() {
+    g_scanOnOffStates.clear();
+    const uint32_t scanId = g_discoveryResult.scan_id;
+    g_scanHeapFreeBefore = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    g_scanPsramFreeBefore = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    ESP_LOGI(TAG, "worker_stack_size=%u task=discovery", static_cast<unsigned>(COMMAND_WORKER_STACK_SIZE));
+    ESP_LOGI(TAG, "device_item_size=%u cache_safety_limit=%u",
+             static_cast<unsigned>(sizeof(MatterDeviceItem)),
+             static_cast<unsigned>(DEVICE_CACHE_SAFETY_LIMIT));
+    ESP_LOGI(TAG, "scan_id=%u scan_start", static_cast<unsigned>(scanId));
     logCurrentTaskDiagnostics("discovery", "worker_start");
-    MatterSavedNode savedNode;
-    std::string reason;
+    static MatterSavedNode savedNode;
+    static std::string reason;
+    std::vector<MatterDeviceItem> previousCache;
+    (void)loadDeviceCache(previousCache);
     const MatterSavedState state = matter_saved_state_load_and_validate(savedNode, reason);
     g_postResult = {};
+    g_postResult.devices.reserve(64);
+    g_discoveryResult.devices.reserve(64);
     g_postResult.status = MatterPostCommissioningStatus::DEVICE_DISCOVERY;
     g_postResult.savedNode = g_savedNode;
     g_discoveryResult.phase = MatterDiscoveryPhase::CONNECTING;
     g_discoveryResult.node_id = savedNode.node_id;
+    ESP_LOGI(TAG, "commissioned_node_count=%u", savedNode.node_id ? 1U : 0U);
     ESP_LOGI("CONTROL_MATTER_DISCOVERY", "start node=0x%llx",
              static_cast<unsigned long long>(savedNode.node_id));
 
     if (state != MatterSavedState::Valid) {
+        ESP_LOGI(TAG, "commissioned_node_count=0");
+        ESP_LOGI(TAG, "endpoint_count=0 clusters=none classified_as_light=no cache_device_count=0 serialized_device_count=0");
         g_discoveryResult.phase = MatterDiscoveryPhase::FAILED;
         g_postResult.status = state == MatterSavedState::Invalid
             ? MatterPostCommissioningStatus::SAVED_NODE_INVALID
@@ -2087,35 +2295,43 @@ void matterDiscoveryWorker(void *) {
             ESP_LOGW(TAG, "controller_init_skipped reason=invalid_saved_metadata");
             setControllerState(MatterControllerState::FailedInvalidMetadata);
         }
-        g_discoveryTask = nullptr;
-        vTaskDelete(nullptr);
+        logDiscoveryComplete();
         return;
     }
 
     char savedNodeBuf[24];
     formatMatterId(savedNode.node_id, savedNodeBuf, sizeof(savedNodeBuf));
+    ESP_LOGI(TAG, "commissioned_node_count=1");
+    ESP_LOGI(TAG, "commissioned_node=%s", savedNodeBuf);
     ESP_LOGI(TAG, "use_saved_node remote_node_id=%s", savedNodeBuf);
     ESP_LOGI(TAG, "discovery_refresh_start node_id=%s", savedNodeBuf);
+    ESP_LOGI(TAG, "node_scan_start=%s", savedNodeBuf);
 
     ESP_LOGI(TAG, "controller_ready=%s", matter_controller_is_ready() ? "yes" : "no");
     esp_err_t err = matter_controller_is_ready() ? ESP_OK : matter_controller_early_init();
     if (err != ESP_OK) {
+        ESP_LOGI(TAG, "node_reachable=no error=%s", esp_err_to_name(err));
+        preserveKnownDevices(g_postResult.devices, previousCache);
+        ESP_LOGI(TAG, "endpoint_count=0 clusters=none classified_as_light=no cache_device_count=0 serialized_device_count=0");
         g_discoveryResult.phase = MatterDiscoveryPhase::FAILED;
         g_postResult.status = MatterPostCommissioningStatus::SAVED_NODE_INVALID;
         g_postResult.error = err;
         g_discoveryResult.error = err;
         g_postResult.errorText = "Matter fabric corrompue";
-        g_discoveryTask = nullptr;
-        vTaskDelete(nullptr);
+        logDiscoveryComplete();
         return;
     }
 
     g_discoveryResult.phase = MatterDiscoveryPhase::READING_ROOT_DESCRIPTOR;
-    ReadWaitContext readCtx;
+    static ReadWaitContext readCtx;
     err = readMatterAttribute(readCtx, savedNode.node_id, 0,
                               chip::app::Clusters::Descriptor::Id,
                               chip::app::Clusters::Descriptor::Attributes::PartsList::Id);
     if (err != ESP_OK) {
+        if (err == ESP_ERR_INVALID_SIZE) g_discoveryResult.truncated = true;
+        ESP_LOGI(TAG, "node_reachable=no error=%s", esp_err_to_name(err));
+        preserveKnownDevices(g_postResult.devices, previousCache);
+        ESP_LOGI(TAG, "endpoint_count=0 clusters=none classified_as_light=no cache_device_count=0 serialized_device_count=0");
         ESP_LOGW(TAG, "device_discovery_failed step=parts_list err=%s", esp_err_to_name(err));
         g_discoveryResult.phase = MatterDiscoveryPhase::FAILED;
         g_discoveryResult.error = err;
@@ -2125,23 +2341,26 @@ void matterDiscoveryWorker(void *) {
         g_postResult.errorText = err == ESP_ERR_TIMEOUT
             ? "Connexion Matter impossible"
             : "Lecture appareils échouée";
-        g_discoveryTask = nullptr;
-        vTaskDelete(nullptr);
+        logDiscoveryComplete();
         return;
     }
 
     g_discoveryResult.phase = MatterDiscoveryPhase::READING_ENDPOINTS;
-    for (size_t endpointIndex = 0; endpointIndex < readCtx.endpoint_count; ++endpointIndex) {
+    ESP_LOGI(TAG, "node_reachable=yes");
+    ESP_LOGI(TAG, "endpoint_count=%u", static_cast<unsigned>(readCtx.endpoint_count));
+    for (size_t endpointIndex = 0; endpointIndex < readCtx.endpoints.size(); ++endpointIndex) {
         const uint16_t endpoint = readCtx.endpoints[endpointIndex];
         if (endpoint == 0) continue;
         ESP_LOGI("CONTROL_MATTER_DISCOVERY", "endpoint=%u descriptor_read_start", endpoint);
-        MatterDeviceItem item;
+        static MatterDeviceItem item;
+        item = {};
         item.endpoint_id = endpoint;
 
-        ReadWaitContext serverCtx;
-        if (readMatterAttribute(serverCtx, savedNode.node_id, endpoint,
+        static ReadWaitContext serverCtx;
+        const bool descriptorRead = readMatterAttribute(serverCtx, savedNode.node_id, endpoint,
                                 chip::app::Clusters::Descriptor::Id,
-                                chip::app::Clusters::Descriptor::Attributes::ServerList::Id) == ESP_OK) {
+                                chip::app::Clusters::Descriptor::Attributes::ServerList::Id) == ESP_OK;
+        if (descriptorRead) {
             for (size_t clusterIndex = 0; clusterIndex < serverCtx.cluster_count; ++clusterIndex) {
                 const uint32_t clusterId = serverCtx.cluster_ids[clusterIndex];
                 if (clusterId == chip::app::Clusters::OnOff::Id) {
@@ -2156,18 +2375,30 @@ void matterDiscoveryWorker(void *) {
                     item.has_switch = true;
                 }
             }
+            char clusters[128] = "";
+            size_t clustersLength = 0;
+            for (size_t clusterIndex = 0; clusterIndex < serverCtx.cluster_count; ++clusterIndex) {
+                clustersLength += static_cast<size_t>(snprintf(
+                    clusters + clustersLength, sizeof(clusters) - clustersLength,
+                    "%s0x%04lx", clusterIndex ? "," : "",
+                    static_cast<unsigned long>(serverCtx.cluster_ids[clusterIndex])));
+                if (clustersLength >= sizeof(clusters)) { clusters[sizeof(clusters) - 1] = '\0'; break; }
+            }
+            ESP_LOGI(TAG, "endpoint=%u clusters=%s", endpoint, clusters[0] ? clusters : "none");
         }
 
-        ReadWaitContext typeCtx;
-        if (readMatterAttribute(typeCtx, savedNode.node_id, endpoint,
-                                chip::app::Clusters::Descriptor::Id,
-                                chip::app::Clusters::Descriptor::Attributes::DeviceTypeList::Id) == ESP_OK) {
-            for (size_t typeIndex = 0; typeIndex < typeCtx.device_type_count; ++typeIndex) {
-                const uint32_t deviceType = typeCtx.device_types[typeIndex];
-                if (item.device_type == 0) item.device_type = deviceType;
-                if (isLightDeviceType(deviceType) || isKnownOnOffDeviceType(deviceType)) {
-                    item.device_type = deviceType;
-                    break;
+        {
+            static ReadWaitContext typeCtx;
+            if (readMatterAttribute(typeCtx, savedNode.node_id, endpoint,
+                                    chip::app::Clusters::Descriptor::Id,
+                                    chip::app::Clusters::Descriptor::Attributes::DeviceTypeList::Id) == ESP_OK) {
+                for (size_t typeIndex = 0; typeIndex < typeCtx.device_type_count; ++typeIndex) {
+                    const uint32_t deviceType = typeCtx.device_types[typeIndex];
+                    if (item.device_type == 0) item.device_type = deviceType;
+                    if (isLightDeviceType(deviceType) || isKnownOnOffDeviceType(deviceType)) {
+                        item.device_type = deviceType;
+                        break;
+                    }
                 }
             }
         }
@@ -2178,34 +2409,69 @@ void matterDiscoveryWorker(void *) {
         else if (item.has_switch) item.primary_cluster_class = chip::app::Clusters::Switch::Id;
         item.type_label = fallbackTypeLabel(item);
 
-        ReadWaitContext reachableCtx;
-        if (readMatterAttribute(reachableCtx, savedNode.node_id, endpoint,
-                                chip::app::Clusters::BridgedDeviceBasicInformation::Id,
-                                chip::app::Clusters::BridgedDeviceBasicInformation::Attributes::Reachable::Id,
-                                6000) == ESP_OK) {
-            item.reachable_known = true;
-            item.reachable = reachableCtx.bool_value;
-        }
+        {
+            static ReadWaitContext reachableCtx;
+            if (readMatterAttribute(reachableCtx, savedNode.node_id, endpoint,
+                                    chip::app::Clusters::BridgedDeviceBasicInformation::Id,
+                                    chip::app::Clusters::BridgedDeviceBasicInformation::Attributes::Reachable::Id,
+                                    6000) == ESP_OK) {
+                item.reachable_known = true;
+                item.reachable = reachableCtx.bool_value;
+                ESP_LOGI("CONTROL_MATTER_DISCOVERY", "endpoint=%u reachable=%s", endpoint,
+                         item.reachable ? "yes" : "no");
+            }
 
-        if (item.has_onoff) {
-            ReadWaitContext onoffCtx;
-            if (readMatterAttribute(onoffCtx, savedNode.node_id, endpoint,
-                                    chip::app::Clusters::OnOff::Id,
-                                    chip::app::Clusters::OnOff::Attributes::OnOff::Id) == ESP_OK) {
-                item.onoff_state_known = true;
-                item.onoff_state = onoffCtx.bool_value;
-                ESP_LOGI(TAG, "read_onoff endpoint=%u state=%s", endpoint, item.onoff_state ? "on" : "off");
+            if (item.has_onoff) {
+                static ReadWaitContext onoffCtx;
+                if (readMatterAttribute(onoffCtx, savedNode.node_id, endpoint,
+                                        chip::app::Clusters::OnOff::Id,
+                                        chip::app::Clusters::OnOff::Attributes::OnOff::Id) == ESP_OK) {
+                    item.onoff_state_known = true;
+                    item.onoff_state = onoffCtx.bool_value;
+                    ESP_LOGI("CONTROL_MATTER", "state_read node=%s endpoint=%u onoff=%u source=discovery", savedNodeBuf, endpoint,
+                             item.onoff_state ? 1U : 0U);
+                }
+            }
+
+            item.last_seen_unix_or_boot_counter = timestampNow();
+        }
+        if (!descriptorRead) {
+            item.reachable_known = true;
+            item.reachable = false;
+            item.name = fallbackDeviceName(item);
+            item.name_source = "endpoint_fallback";
+        } else if (!tryReadEndpointName(savedNode.node_id, item)) {
+            for (const MatterDeviceItem &previous : previousCache) {
+                if (previous.endpoint_id != endpoint || previous.name.empty() || isGeneratedDeviceName(previous)) continue;
+                item.name = previous.name;
+                item.name_source = "cache";
+                ESP_LOGI(TAG, "read_endpoint_name endpoint=%u source=cache name=\"%s\"",
+                         endpoint, item.name.c_str());
+                break;
             }
         }
-
-        item.last_seen_unix_or_boot_counter = timestampNow();
-        if (!tryReadEndpointName(savedNode.node_id, item)) {
-            item.name = "Appareil endpoint " + std::to_string(endpoint);
+        if (item.name.empty()) {
+            item.name = fallbackDeviceName(item);
+            item.name_source = "endpoint_fallback";
+        }
+        if (!descriptorRead) {
+            for (const MatterDeviceItem &previous : previousCache) {
+                if (previous.endpoint_id != endpoint) continue;
+                item.has_onoff = previous.has_onoff;
+                item.has_level_control = previous.has_level_control;
+                item.has_color_control = previous.has_color_control;
+                item.has_switch = previous.has_switch;
+                item.device_type = previous.device_type;
+                item.primary_cluster_class = previous.primary_cluster_class;
+                item.type_label = previous.type_label;
+                break;
+            }
         }
         MatterDiscoveredDevice discovered;
         discovered.node_id = savedNode.node_id;
         discovered.endpoint_id = endpoint;
         copyBounded(discovered.display_name, sizeof(discovered.display_name), item.name);
+        copyBounded(discovered.name_source, sizeof(discovered.name_source), item.name_source);
         discovered.has_onoff = item.has_onoff;
         discovered.has_level_control = item.has_level_control;
         discovered.reachable_known = item.reachable_known;
@@ -2214,31 +2480,60 @@ void matterDiscoveryWorker(void *) {
         discovered.onoff_state = item.onoff_state;
         discovered.primary_device_type = item.device_type;
         discovered.is_aggregator = item.device_type == 0x000E || item.device_type == 0x0016;
-        discovered.is_light_candidate = endpoint != 0 && item.has_onoff && !discovered.is_aggregator &&
+        discovered.is_light_candidate = isControlLight(item) && !discovered.is_aggregator &&
                                         (!item.reachable_known || item.reachable);
-        if (g_discoveryResult.endpoint_count < MATTER_DISCOVERY_MAX_ENDPOINTS) {
-            g_discoveryResult.devices[g_discoveryResult.endpoint_count++] = discovered;
-            if (discovered.is_light_candidate) ++g_discoveryResult.light_count;
-        } else if (!g_discoveryResult.truncated) {
+        ESP_LOGI("CONTROL_MATTER", "endpoint=%u name=%s has_onoff=%s has_level=%s device_type=0x%08lx classified_as_light=%s exposed_to_ui=%s exclusion_reason=%s",
+                 static_cast<unsigned>(endpoint), item.name.c_str(), item.has_onoff ? "yes" : "no",
+                 item.has_level_control ? "yes" : "no", static_cast<unsigned long>(item.device_type),
+                 discovered.is_light_candidate ? "yes" : "no", isMainListVisible(item) ? "yes" : "no",
+                 isMainListVisible(item) ? "none" : "non_controllable_normal_view");
+        if (g_postResult.devices.size() >= DEVICE_CACHE_SAFETY_LIMIT) {
             g_discoveryResult.truncated = true;
-            ESP_LOGW("CONTROL_MATTER_DISCOVERY", "endpoint_truncated capacity=%u",
-                     static_cast<unsigned>(MATTER_DISCOVERY_MAX_ENDPOINTS));
+            g_discoveryResult.error = ESP_ERR_INVALID_SIZE;
+            g_postResult.status = MatterPostCommissioningStatus::DISCOVERY_FAILED;
+            g_postResult.error = ESP_ERR_INVALID_SIZE;
+            g_postResult.errorText = "Trop d'appareils Matter";
+            ESP_LOGE(TAG, "ERROR: device_cache_add_failed node=%s endpoint=%u discovered_so_far=%u",
+                     savedNodeBuf, static_cast<unsigned>(endpoint),
+                     static_cast<unsigned>(g_postResult.devices.size()));
+            logDiscoveryComplete();
+            return;
         }
+        g_discoveryResult.devices.push_back(discovered);
+        g_discoveryResult.endpoint_count = static_cast<uint16_t>(g_discoveryResult.devices.size());
+        if (discovered.is_light_candidate) ++g_discoveryResult.light_count;
         ESP_LOGI("CONTROL_MATTER_DISCOVERY", "endpoint=%u name=\"%s\"", endpoint, item.name.c_str());
         ESP_LOGI("CONTROL_MATTER_DISCOVERY", "endpoint=%u type=0x%08lx", endpoint,
                  static_cast<unsigned long>(item.device_type));
         ESP_LOGI("CONTROL_MATTER_DISCOVERY", "endpoint=%u light_candidate=%s", endpoint,
                  discovered.is_light_candidate ? "yes" : "no");
-        if (!isMainListVisible(item)) {
-            ESP_LOGI(TAG, "endpoint_classified endpoint=%u type=%s has_onoff=%s has_switch=%s name=\"%s\" visible=diagnostic_only",
-                     endpoint, item.type_label.c_str(), item.has_onoff ? "yes" : "no",
-                     item.has_switch ? "yes" : "no", item.name.c_str());
-            continue;
-        }
+        ESP_LOGI(TAG, "name_source=%s node=%s endpoint=%u resolved_name=\"%s\"",
+                 item.name_source.empty() ? "unknown" : item.name_source.c_str(), savedNodeBuf,
+                 static_cast<unsigned>(endpoint), item.name.c_str());
+        ESP_LOGI(TAG, "endpoint=%u device_types=%s clusters=%s classified_as_light=%s",
+                 static_cast<unsigned>(endpoint), item.device_type ? "present" : "none",
+                 descriptorRead ? "read" : "unavailable",
+                 discovered.is_light_candidate ? "yes" : "no");
+        ESP_LOGI(TAG, "classified_as_light=%s", discovered.is_light_candidate ? "yes" : "no");
         ESP_LOGI(TAG, "endpoint_classified endpoint=%u type=%s has_onoff=%s has_switch=%s name=\"%s\"",
                  endpoint, item.type_label.c_str(), item.has_onoff ? "yes" : "no",
                  item.has_switch ? "yes" : "no", item.name.c_str());
         g_postResult.devices.push_back(item);
+    }
+
+    preserveKnownDevices(g_postResult.devices, previousCache);
+    // A command can complete after this scan already read the old lamp state.
+    for (const auto &[endpoint, on] : g_scanOnOffStates) {
+        for (auto &device : g_postResult.devices) {
+            if (device.endpoint_id != endpoint) continue;
+            device.onoff_state_known = true;
+            device.onoff_state = on;
+        }
+        for (auto &device : g_discoveryResult.devices) {
+            if (device.endpoint_id != endpoint) continue;
+            device.onoff_state_known = true;
+            device.onoff_state = on;
+        }
     }
 
     std::stable_sort(g_postResult.devices.begin(), g_postResult.devices.end(),
@@ -2247,7 +2542,17 @@ void matterDiscoveryWorker(void *) {
                          if (a.has_switch != b.has_switch) return a.has_switch < b.has_switch;
                          return a.endpoint_id < b.endpoint_id;
                      });
-    (void)saveDeviceCache(g_postResult.devices);
+    const esp_err_t cacheErr = saveDeviceCache(g_postResult.devices);
+    if (cacheErr != ESP_OK) {
+        g_discoveryResult.error = cacheErr;
+        g_postResult.status = MatterPostCommissioningStatus::DISCOVERY_FAILED;
+        g_postResult.error = cacheErr;
+        g_postResult.errorText = "Enregistrement du cache Matter échoué";
+        logDiscoveryComplete();
+        return;
+    }
+    ESP_LOGI(TAG, "cache_device_count=%u", static_cast<unsigned>(g_postResult.devices.size()));
+    ESP_LOGI(TAG, "serialized_device_count=%u", static_cast<unsigned>(g_postResult.devices.size()));
 
     g_postResult.status = MatterPostCommissioningStatus::DEVICE_LIST;
     g_postResult.error = ESP_OK;
@@ -2258,23 +2563,103 @@ void matterDiscoveryWorker(void *) {
     ESP_LOGI("CONTROL_MATTER_DISCOVERY", "complete endpoints=%u lights=%u",
              static_cast<unsigned>(g_discoveryResult.endpoint_count),
              static_cast<unsigned>(g_discoveryResult.light_count));
+    logDiscoveryComplete();
     ESP_LOGI(TAG, "worker_stack_high_water=%u task=discovery",
              static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
-    g_discoveryTask = nullptr;
-    vTaskDelete(nullptr);
+}
+
+void executeUiCommand(const MatterUiCommand &command) {
+    const uint32_t commandId = command.action == MatterUiAction::SetBrightness
+        ? chip::app::Clusters::LevelControl::Commands::MoveToLevel::Id
+        : command.action == MatterUiAction::SetOn
+            ? chip::app::Clusters::OnOff::Commands::On::Id
+            : command.action == MatterUiAction::SetOff
+                ? chip::app::Clusters::OnOff::Commands::Off::Id
+                : chip::app::Clusters::OnOff::Commands::Toggle::Id;
+    char nodeBuf[24];
+    formatMatterId(command.node_id, nodeBuf, sizeof(nodeBuf));
+    ESP_LOGI("CONTROL_MATTER_UI",
+             "invoke_start node=%s endpoint=%u cluster=0x%04lx command=0x%02lx",
+             nodeBuf, static_cast<unsigned>(command.endpoint_id),
+             static_cast<unsigned long>(command.action == MatterUiAction::SetBrightness
+                 ? chip::app::Clusters::LevelControl::Id : chip::app::Clusters::OnOff::Id),
+             static_cast<unsigned long>(commandId));
+    MatterUiResult result;
+    result.command = command;
+    CHIP_ERROR chipError = CHIP_ERROR_TIMEOUT;
+    if (!matter_controller_is_ready()) result.error = ESP_ERR_INVALID_STATE;
+    else if (command.action == MatterUiAction::SetBrightness) {
+        result.error = sendLevelCommandSync(command.node_id, command.endpoint_id, command.brightness, 10000, &chipError);
+    } else {
+        ESP_LOGI("CONTROL_MATTER", "command_onoff node=%s endpoint=%u requested=%u", nodeBuf,
+                 static_cast<unsigned>(command.endpoint_id), command.action == MatterUiAction::SetOn ? 1U : 0U);
+        result.error = sendOnOffCommandSync(command.node_id, command.endpoint_id, commandId, 10000, &chipError);
+    }
+    result.chip_error = static_cast<uint32_t>(chipError.GetValue());
+    result.success = result.error == ESP_OK;
+    if (result.success) {
+        if (command.action == MatterUiAction::SetBrightness) {
+            result.error = matter_controller_read_level(command.node_id, command.endpoint_id, result.level);
+            result.level_known = result.error == ESP_OK;
+        } else {
+            result.error = matter_controller_read_onoff(command.node_id, command.endpoint_id, result.state);
+            result.state_known = result.error == ESP_OK;
+            ESP_LOGI("CONTROL_MATTER", "readback_onoff=%u node=%s endpoint=%u", result.state ? 1U : 0U, nodeBuf,
+                     static_cast<unsigned>(command.endpoint_id));
+        }
+        if (!result.state_known && !result.level_known) result.error = ESP_OK;
+    }
+    if (result.success) {
+        if (g_discoveryTask && command.action != MatterUiAction::SetBrightness) {
+            if (command.action == MatterUiAction::SetOn || command.action == MatterUiAction::SetOff) {
+                g_scanOnOffStates[command.endpoint_id] = command.action == MatterUiAction::SetOn;
+            } else if (result.state_known) {
+                g_scanOnOffStates[command.endpoint_id] = result.state;
+            }
+        }
+        ESP_LOGI("CONTROL_MATTER", "command_result=success node=%s endpoint=%u state_known=%s", nodeBuf,
+                 static_cast<unsigned>(command.endpoint_id), result.state_known ? "yes" : "no");
+        ESP_LOGI("CONTROL_MATTER_UI", "invoke_success node=%s endpoint=%u action=%s",
+                 nodeBuf, static_cast<unsigned>(command.endpoint_id),
+                 command.action == MatterUiAction::SetOn ? "on" :
+                 command.action == MatterUiAction::SetOff ? "off" :
+                 command.action == MatterUiAction::Toggle ? "toggle" : "brightness");
+    } else {
+        ESP_LOGW("CONTROL_MATTER_UI", "invoke_failed node=%s endpoint=%u error=%s chip_error=0x%lx",
+                 nodeBuf, static_cast<unsigned>(command.endpoint_id),
+                 esp_err_to_name(result.error), static_cast<unsigned long>(result.chip_error));
+    }
+    if (g_uiResultQueue && xQueueSend(g_uiResultQueue, &result, 0) != pdPASS) {
+        ESP_LOGW("CONTROL_MATTER_UI", "result_drop device=%u", static_cast<unsigned>(command.ui_device_id));
+    }
 }
 
 void matterCommandWorker(void *arg);
 
+void servicePendingUiCommands() {
+    static bool servicing = false;
+    if (!g_discoveryTask || xTaskGetCurrentTaskHandle() != g_commandTask || servicing) return;
+    servicing = true;
+    CommandWorkerArgs args;
+    // Stay on the same worker: attribute callbacks use a single read context.
+    for (size_t i = 0; i < COMMAND_QUEUE_LENGTH; ++i) {
+        if (xQueuePeek(g_commandQueue, &args, 0) != pdTRUE || !args.from_ui || args.discovery) break;
+        if (xQueueReceive(g_commandQueue, &args, 0) != pdTRUE) break;
+        executeUiCommand(args.ui_command);
+    }
+    servicing = false;
+}
+
 esp_err_t ensureCommandWorker() {
     if (g_commandQueue == nullptr) {
         g_commandQueue = xQueueCreate(COMMAND_QUEUE_LENGTH, sizeof(CommandWorkerArgs));
+        ESP_LOGI(TAG, "command_queue_create result=%s", g_commandQueue ? "ok" : "failed");
         if (!g_commandQueue) return ESP_ERR_NO_MEM;
     }
     if (g_commandTask != nullptr) return ESP_OK;
-    const BaseType_t created = xTaskCreate(
+    const BaseType_t created = xTaskCreateWithCaps(
         matterCommandWorker, "control_matter_cmd", COMMAND_WORKER_STACK_SIZE, nullptr,
-        MATTER_COMMAND_WORKER_PRIORITY, &g_commandTask);
+        MATTER_COMMAND_WORKER_PRIORITY, &g_commandTask, MATTER_TASK_MEMORY_CAPS);
     if (created != pdPASS) {
         g_commandTask = nullptr;
         return ESP_ERR_NO_MEM;
@@ -2288,38 +2673,13 @@ void matterCommandWorker(void *) {
     for (;;) {
         CommandWorkerArgs args;
         if (xQueueReceive(g_commandQueue, &args, portMAX_DELAY) != pdTRUE) continue;
+        if (args.discovery) {
+            matterDiscoveryRun();
+            g_discoveryTask = nullptr;
+            continue;
+        }
         if (args.from_ui) {
-            const MatterUiCommand &command = args.ui_command;
-            const uint32_t commandId = command.action == MatterUiAction::SetOn
-                ? chip::app::Clusters::OnOff::Commands::On::Id
-                : command.action == MatterUiAction::SetOff
-                    ? chip::app::Clusters::OnOff::Commands::Off::Id
-                    : chip::app::Clusters::OnOff::Commands::Toggle::Id;
-            char nodeBuf[24];
-            formatMatterId(command.node_id, nodeBuf, sizeof(nodeBuf));
-            ESP_LOGI("CONTROL_MATTER_UI",
-                     "invoke_start node=%s endpoint=%u cluster=0x0006 command=0x%02lx",
-                     nodeBuf, static_cast<unsigned>(command.endpoint_id),
-                     static_cast<unsigned long>(commandId));
-            MatterUiResult result;
-            result.command = command;
-            result.error = matter_controller_is_ready()
-                ? sendOnOffCommandSync(command.node_id, command.endpoint_id, commandId)
-                : ESP_ERR_INVALID_STATE;
-            result.success = result.error == ESP_OK;
-            if (result.success) {
-                ESP_LOGI("CONTROL_MATTER_UI", "invoke_success node=%s endpoint=%u action=%s",
-                         nodeBuf, static_cast<unsigned>(command.endpoint_id),
-                         command.action == MatterUiAction::SetOn ? "on" :
-                         command.action == MatterUiAction::SetOff ? "off" : "toggle");
-            } else {
-                ESP_LOGW("CONTROL_MATTER_UI", "invoke_failed node=%s endpoint=%u error=%s",
-                         nodeBuf, static_cast<unsigned>(command.endpoint_id),
-                         esp_err_to_name(result.error));
-            }
-            if (g_uiResultQueue && xQueueSend(g_uiResultQueue, &result, 0) != pdPASS) {
-                ESP_LOGW("CONTROL_MATTER_UI", "result_drop device=%u", static_cast<unsigned>(command.ui_device_id));
-            }
+            executeUiCommand(args.ui_command);
             continue;
         }
         const MatterUiCommand &command = args.ui_command;
@@ -2477,21 +2837,29 @@ esp_err_t matter_controller_start_device_discovery() {
     g_discoveryResult = {};
     g_discoveryResult.phase = MatterDiscoveryPhase::CONNECTING;
     g_discoveryResult.node_id = g_savedNode.node_id;
+    g_discoveryResult.scan_id = ++g_nextScanId;
+    g_scanStartedUs = esp_timer_get_time();
+    ESP_LOGI(TAG, "scan_id=%u scan_start", static_cast<unsigned>(g_discoveryResult.scan_id));
     g_postResult.status = MatterPostCommissioningStatus::DEVICE_DISCOVERY;
     g_postResult.savedNode = g_savedNode;
-    const BaseType_t created = xTaskCreate(
-        matterDiscoveryWorker,
-        "control_matter_discovery",
-        DISCOVERY_WORKER_STACK_SIZE,
-        nullptr,
-        MATTER_DISCOVERY_WORKER_PRIORITY,
-        &g_discoveryTask);
-    if (created != pdPASS) {
+    const esp_err_t workerErr = ensureCommandWorker();
+    if (workerErr != ESP_OK) {
+        ESP_LOGI(TAG, "discovery_start_failed error=%s", esp_err_to_name(workerErr));
+        g_postResult.status = MatterPostCommissioningStatus::DISCOVERY_FAILED;
+        g_postResult.error = workerErr;
+        g_postResult.errorText = "Lecture appareils échouée";
+        return workerErr;
+    }
+    CommandWorkerArgs args;
+    args.discovery = true;
+    g_discoveryTask = g_commandTask;
+    if (xQueueSend(g_commandQueue, &args, 0) != pdPASS) {
         g_discoveryTask = nullptr;
         g_postResult.status = MatterPostCommissioningStatus::DISCOVERY_FAILED;
-        g_postResult.error = ESP_ERR_NO_MEM;
+        g_postResult.error = ESP_ERR_TIMEOUT;
         g_postResult.errorText = "Lecture appareils échouée";
-        return ESP_ERR_NO_MEM;
+        ESP_LOGI(TAG, "discovery_start_failed error=%s", esp_err_to_name(ESP_ERR_TIMEOUT));
+        return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
 #else
@@ -2532,9 +2900,8 @@ esp_err_t matter_controller_load_device_cache(MatterPostCommissioningResult &out
     out.status = out.devices.empty() ? MatterPostCommissioningStatus::IDLE
                                      : MatterPostCommissioningStatus::DEVICE_LIST;
     out.error = err;
-    if (err == ESP_OK) {
-        g_postResult = out;
-    }
+    // Reading the persisted cache must not replace the scan being built.
+    if (err == ESP_OK && g_discoveryTask == nullptr) g_postResult = out;
     return err;
 #else
     out.error = ESP_ERR_NOT_SUPPORTED;
@@ -2571,7 +2938,7 @@ void matter_controller_log_ui_endpoints(const MatterPostCommissioningResult &res
 void matter_controller_log_ui_endpoints(const MatterDiscoveryResult &result) {
     char nodeBuf[24];
     formatMatterId(result.node_id, nodeBuf, sizeof(nodeBuf));
-    for (size_t i = 0; i < result.endpoint_count; ++i) {
+    for (size_t i = 0; i < result.devices.size(); ++i) {
         const MatterDiscoveredDevice &device = result.devices[i];
         ESP_LOGI("CONTROL_MATTER_UI", "endpoint node=%s endpoint=%u name=\"%s\" onoff=%s",
                  nodeBuf, static_cast<unsigned>(device.endpoint_id), device.display_name,
@@ -2593,6 +2960,7 @@ esp_err_t matter_controller_ui_init() {
     }
     if (g_uiResultQueue == nullptr) {
         g_uiResultQueue = xQueueCreate(COMMAND_QUEUE_LENGTH, sizeof(MatterUiResult));
+        ESP_LOGI(TAG, "ui_result_queue_create result=%s", g_uiResultQueue ? "ok" : "failed");
         if (!g_uiResultQueue) return ESP_ERR_NO_MEM;
     }
     return ensureCommandWorker();
@@ -2622,7 +2990,8 @@ esp_err_t matter_controller_ui_enqueue(const MatterUiCommand &command) {
     ESP_LOGI("CONTROL_MATTER_UI", "enqueue node=%s endpoint=%u action=%s device=%u",
              nodeBuf, static_cast<unsigned>(command.endpoint_id),
              command.action == MatterUiAction::SetOn ? "on" :
-             command.action == MatterUiAction::SetOff ? "off" : "toggle",
+             command.action == MatterUiAction::SetOff ? "off" :
+             command.action == MatterUiAction::Toggle ? "toggle" : "brightness",
              static_cast<unsigned>(command.ui_device_id));
     return ESP_OK;
 #else
@@ -2657,13 +3026,39 @@ esp_err_t matter_controller_read_onoff(uint64_t node_id, uint16_t endpoint_id, b
                                         chip::app::Clusters::OnOff::Attributes::OnOff::Id);
     if (err == ESP_OK) {
         out_state = ctx.bool_value;
-        ESP_LOGI(TAG, "read_onoff endpoint=%u state=%s", endpoint_id, out_state ? "on" : "off");
+        char nodeBuf[24]; formatMatterId(node_id, nodeBuf, sizeof(nodeBuf));
+        ESP_LOGI("CONTROL_MATTER", "state_read node=%s endpoint=%u onoff=%u source=matter_read", nodeBuf,
+                 static_cast<unsigned>(endpoint_id), out_state ? 1U : 0U);
     }
     return err;
 #else
     (void)node_id;
     (void)endpoint_id;
     out_state = false;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+esp_err_t matter_controller_read_level(uint64_t node_id, uint16_t endpoint_id, uint8_t &out_level) {
+#if CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL
+    MatterSavedNode savedNode;
+    std::string reason;
+    if (matter_saved_state_load_and_validate(savedNode, reason) != MatterSavedState::Valid ||
+        !isValidRemoteNodeId(node_id) || node_id != savedNode.node_id ||
+        g_controllerState != MatterControllerState::ControllerReady) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    ReadWaitContext ctx;
+    const esp_err_t err = readMatterAttribute(ctx, node_id, endpoint_id,
+                                              chip::app::Clusters::LevelControl::Id,
+                                              chip::app::Clusters::LevelControl::Attributes::CurrentLevel::Id,
+                                              6000);
+    if (err == ESP_OK) out_level = ctx.level_value;
+    return err;
+#else
+    (void)node_id;
+    (void)endpoint_id;
+    out_level = 0;
     return ESP_ERR_NOT_SUPPORTED;
 #endif
 }
@@ -2706,6 +3101,28 @@ esp_err_t matter_controller_send_off(uint64_t node_id, uint16_t endpoint_id) {
 #else
     (void)node_id;
     (void)endpoint_id;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+esp_err_t matter_controller_ui_set_brightness(uint64_t node_id, uint16_t endpoint_id, uint8_t brightness,
+                                              uint32_t ui_device_id, uint32_t batch_id) {
+#if CONFIG_CONTROL_MATTER_COMMISSIONING_EXPERIMENTAL && CONFIG_CONTROL_UI_MATTER_COMMANDS
+    if (brightness > 254 || ui_device_id == 0) return ESP_ERR_INVALID_ARG;
+    MatterUiCommand command;
+    command.node_id = node_id;
+    command.endpoint_id = endpoint_id;
+    command.action = MatterUiAction::SetBrightness;
+    command.ui_device_id = ui_device_id;
+    command.batch_id = batch_id;
+    command.brightness = brightness;
+    return matter_controller_ui_enqueue(command);
+#else
+    (void)node_id;
+    (void)endpoint_id;
+    (void)brightness;
+    (void)ui_device_id;
+    (void)batch_id;
     return ESP_ERR_NOT_SUPPORTED;
 #endif
 }

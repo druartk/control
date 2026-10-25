@@ -6,6 +6,7 @@
 #include "ed047tc1.h"
 #include "i2s_data_bus.h"
 #include "rmt_pulse.h"
+#include <freertos/FreeRTOS.h>
 
 #if ESP_IDF_VERSION_MAJOR >= 5
 #include <soc/gpio_struct.h>  // GPIO.out_w1ts / GPIO.out_w1tc — required in IDF 5.x
@@ -49,23 +50,22 @@ typedef struct
 /******************************************************************************/
 
 static epd_config_register_t config_reg;
+static portMUX_TYPE frame_start_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /******************************************************************************/
 /***        exported functions                                              ***/
 /******************************************************************************/
 
-/*
- * Write bits directly using the registers.
- * Won't work for some pins (>= 32).
- */
 inline static void fast_gpio_set_hi(gpio_num_t gpio_num)
 {
-    GPIO.out_w1ts = (1 << gpio_num);
+    if (gpio_num < 32) GPIO.out_w1ts = (1U << gpio_num);
+    else GPIO.out1_w1ts.val = (1U << (gpio_num - 32));
 }
 
 inline static void fast_gpio_set_lo(gpio_num_t gpio_num)
 {
-    GPIO.out_w1tc = (1 << gpio_num);
+    if (gpio_num < 32) GPIO.out_w1tc = (1U << gpio_num);
+    else GPIO.out1_w1tc.val = (1U << (gpio_num - 32));
 }
 
 inline static void IRAM_ATTR push_cfg_bit(bool bit)
@@ -119,10 +119,27 @@ esp_err_t epd_base_init(uint32_t epd_row_width)
     config_reg.ep_mode = false;
     config_reg.ep_output_enable = false;
 
-    /* Power Control Output/Off */
-    gpio_set_direction(CFG_DATA, GPIO_MODE_OUTPUT);
-    gpio_set_direction(CFG_CLK, GPIO_MODE_OUTPUT);
-    gpio_set_direction(CFG_STR, GPIO_MODE_OUTPUT);
+    const gpio_num_t output_pins[] = {
+        CFG_DATA, CFG_CLK, CFG_STR, CKV, STH, CKH,
+        D0, D1, D2, D3, D4, D5, D6, D7,
+    };
+    uint64_t output_mask = 0;
+    for (unsigned i = 0; i < sizeof(output_pins) / sizeof(output_pins[0]); ++i) {
+        output_mask |= 1ULL << output_pins[i];
+        // Startup can leave the data pads at the weakest drive setting.
+        esp_err_t err = gpio_set_drive_capability(output_pins[i], GPIO_DRIVE_CAP_DEFAULT);
+        if (err != ESP_OK) return err;
+    }
+    // Select digital pads before the LCD/RMT drivers attach their peripheral signals.
+    const gpio_config_t display_pins = {
+        .pin_bit_mask = output_mask,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    esp_err_t err = gpio_config(&display_pins);
+    if (err != ESP_OK) return err;
     fast_gpio_set_lo(CFG_STR);
 
     push_cfg(&config_reg);
@@ -142,7 +159,7 @@ esp_err_t epd_base_init(uint32_t epd_row_width)
     i2s_config.data_6 = D6;
     i2s_config.data_7 = D7;
 
-    esp_err_t err = i2s_bus_init(&i2s_config);
+    err = i2s_bus_init(&i2s_config);
     if (err != ESP_OK) return err;
 
     return rmt_pulse_init(CKV);
@@ -186,22 +203,27 @@ void epd_poweroff_all()
     push_cfg(&config_reg);
 }
 
-void epd_start_frame()
+void IRAM_ATTR epd_start_frame()
 {
     while (i2s_is_busy()) ;
+    pulse_ckv_wait();
 
     config_reg.ep_mode = true;
     push_cfg(&config_reg);
 
     pulse_ckv_us(1, 1, true);
 
-    // This is very timing-sensitive!
+    pulse_ckv_prepare_frame_start();
+    // STV must be released during CKV, without a Wi-Fi interrupt or flash-cache stall.
+    portENTER_CRITICAL(&frame_start_mux);
     config_reg.ep_stv = false;
     push_cfg(&config_reg);
     busy_delay(240);
-    pulse_ckv_us(10, 10, false);
+    pulse_ckv_start_frame();
     config_reg.ep_stv = true;
     push_cfg(&config_reg);
+    portEXIT_CRITICAL(&frame_start_mux);
+    pulse_ckv_finish_frame_start();
     pulse_ckv_us(0, 10, true);
 
     config_reg.ep_output_enable = true;
@@ -232,6 +254,8 @@ void  epd_skip()
 void  epd_output_row(uint32_t output_time_dus)
 {
     while (i2s_is_busy());
+    // LCD DMA can finish before CKV; latching then corrupts the active row.
+    pulse_ckv_wait();
 
     latch_row();
 
@@ -243,6 +267,8 @@ void  epd_output_row(uint32_t output_time_dus)
 
 void epd_end_frame()
 {
+    while (i2s_is_busy());
+    pulse_ckv_wait();
     config_reg.ep_output_enable = false;
     push_cfg(&config_reg);
     config_reg.ep_mode = false;

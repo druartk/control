@@ -65,8 +65,31 @@ void DisplayManager::text(int x, int baseline, const std::string &value) {
     writeln(&FiraSans, value.c_str(), &cx, &cy, framebuffer_);
 }
 
-void DisplayManager::title(const std::string &value) {
-    text(28, 58, value);
+int DisplayManager::textWidth(const std::string &value) const {
+    int32_t x = 0, y = 0, x1 = 0, y1 = 0, width = 0, height = 0;
+    get_text_bounds(&FiraSans, value.c_str(), &x, &y, &x1, &y1, &width, &height, nullptr);
+    return width;
+}
+
+std::string DisplayManager::fitTextToWidth(const std::string &value, int maxWidth) const {
+    if (maxWidth <= 0 || textWidth(value) <= maxWidth) return value;
+    constexpr const char *ELLIPSIS = "...";
+    std::string fitted = value;
+    while (!fitted.empty() && textWidth(fitted + ELLIPSIS) > maxWidth) {
+        fitted.pop_back();
+        while (!fitted.empty() && (static_cast<unsigned char>(fitted.back()) & 0xC0) == 0x80) {
+            fitted.pop_back();
+        }
+    }
+    return fitted.empty() ? std::string(ELLIPSIS) : fitted + ELLIPSIS;
+}
+
+void DisplayManager::textFitted(int x, int baseline, const std::string &value, int maxWidth) {
+    text(x, baseline, fitTextToWidth(value, maxWidth));
+}
+
+void DisplayManager::title(const std::string &value, int maxWidth) {
+    textFitted(28, 58, value, maxWidth);
     line(24, 72, WIDTH - 24, 72);
 }
 
@@ -94,15 +117,35 @@ void DisplayManager::fillRectangle(const UiRect &rect, uint8_t gray) {
 
 void DisplayManager::button(const UiRect &rect, const std::string &label, bool inverted) {
     if (!framebuffer_) return;
+    const int maxWidth = rect.width - 40;
+    std::string labels[2] = {fitTextToWidth(label, maxWidth), {}};
+    int lineCount = 1;
+    // shortcut: tiles allow two lines; use a smaller font if longer names must fit fully.
+    if (rect.height >= 110 && textWidth(label) > maxWidth) {
+        size_t split = std::string::npos;
+        for (size_t space = label.find(' '); space != std::string::npos;
+             space = label.find(' ', space + 1)) {
+            if (space > 0 && textWidth(label.substr(0, space)) <= maxWidth) split = space;
+        }
+        if (split != std::string::npos) {
+            labels[0] = label.substr(0, split);
+            labels[1] = fitTextToWidth(label.substr(split + 1), maxWidth);
+            lineCount = 2;
+        }
+    }
     rectangle(rect, inverted);
     int32_t x1 = 0, y1 = 0, w = 0, h = 0;
     int32_t originX = 0, originY = 0;
-    get_text_bounds(&FiraSans, label.c_str(), &originX, &originY, &x1, &y1, &w, &h, nullptr);
     FontProperties props{static_cast<uint8_t>(inverted ? 15 : 0),
                          static_cast<uint8_t>(inverted ? 0 : 15), 0, 0};
-    int32_t x = rect.x + (rect.width - w) / 2;
-    int32_t y = rect.y + (rect.height + FiraSans.ascender) / 2;
-    write_mode(&FiraSans, label.c_str(), &x, &y, framebuffer_, BLACK_ON_WHITE, &props);
+    const int lineSpacing = FiraSans.advance_y + 6;
+    for (int i = 0; i < lineCount; ++i) {
+        originX = originY = 0;
+        get_text_bounds(&FiraSans, labels[i].c_str(), &originX, &originY, &x1, &y1, &w, &h, nullptr);
+        int32_t x = rect.x + (rect.width - w) / 2;
+        int32_t y = rect.y + (rect.height + FiraSans.ascender - (lineCount - 1) * lineSpacing) / 2 + i * lineSpacing;
+        write_mode(&FiraSans, labels[i].c_str(), &x, &y, framebuffer_, BLACK_ON_WHITE, &props);
+    }
 }
 
 void DisplayManager::line(int x0, int y0, int x1, int y1) {
@@ -128,10 +171,22 @@ bool DisplayManager::commitFull(const char *stateName) {
     } else {
         ESP_LOGI(TAG, "render_start state=%s", stateName ? stateName : "unknown");
     }
+    size_t non_white = 0;
+    for (size_t i = 0; i < FRAMEBUFFER_SIZE; ++i) {
+        if (framebuffer_[i] != 0xFF) ++non_white;
+    }
+    ESP_LOGI(TAG, "framebuffer_non_white=%u/%u", static_cast<unsigned>(non_white),
+             static_cast<unsigned>(FRAMEBUFFER_SIZE));
     epd_poweron();
     epd_clear();
-    epd_draw_grayscale_image(epd_full_screen(), framebuffer_);
+    const esp_err_t drawErr = epd_draw_grayscale_image(epd_full_screen(), framebuffer_);
     epd_poweroff();
+    refreshState_ = RefreshState::READY;
+    if (drawErr != ESP_OK) {
+        ESP_LOGE(TAG, "render_failed state=%s err=%s", stateName ? stateName : "unknown",
+                 esp_err_to_name(drawErr));
+        return false;
+    }
     if (firstRender_) {
         ESP_LOGI(TAG, "first_render_done");
         firstRender_ = false;
@@ -159,7 +214,8 @@ esp_err_t DisplayManager::commitRegion(const UiRect &area, const char *reason) {
     const int width = x1 - x0;
     const int height = y1 - y0;
     const size_t packedBytes = static_cast<size_t>((width + 1) / 2) * height;
-    auto *packed = static_cast<uint8_t *>(heap_caps_malloc(packedBytes, MALLOC_CAP_8BIT));
+    auto *packed = static_cast<uint8_t *>(heap_caps_malloc(
+        packedBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!packed) {
         ESP_LOGE(TAG, "partial refresh allocation failed bytes=%u reason=%s",
                  static_cast<unsigned>(packedBytes), reason ? reason : "unknown");
@@ -179,10 +235,16 @@ esp_err_t DisplayManager::commitRegion(const UiRect &area, const char *reason) {
     refreshState_ = RefreshState::PARTIAL_REFRESHING;
     epd_poweron();
     Rect_t rect{x0, y0, width, height};
-    epd_draw_grayscale_image(rect, packed);
+    epd_clear_area(rect);
+    const esp_err_t drawErr = epd_draw_grayscale_image(rect, packed);
     epd_poweroff();
     refreshState_ = RefreshState::READY;
     heap_caps_free(packed);
+    if (drawErr != ESP_OK) {
+        ESP_LOGE(TAG, "partial_refresh_failed area=%s err=%s",
+                 reason ? reason : "unknown", esp_err_to_name(drawErr));
+        return drawErr;
+    }
     ESP_LOGI(TAG, "partial_refresh_done area=%s x=%d y=%d w=%d h=%d",
              reason ? reason : "unknown", x0, y0, width, height);
     return ESP_OK;

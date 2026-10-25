@@ -8,6 +8,8 @@
 #include <ctime>
 #include "app_state.h"
 #include "board/board_config.h"
+#include "config/control_config_serial.h"
+#include "config/control_config_web.h"
 #include "display/display_manager.h"
 #include "esp_app_desc.h"
 #include "esp_log.h"
@@ -23,6 +25,7 @@
 #include "storage/settings_store.h"
 #include "storage/ui_config.h"
 #include "system/control_heap.h"
+#include "system/control_battery.h"
 #include "system/control_time.h"
 #include "touch/touch_manager.h"
 #include "ui/control_ui.h"
@@ -127,11 +130,18 @@ public:
         password_ = savedPassword_;
         ESP_LOGI(TAG, "boot_phase=wifi_init");
         const bool wifiOk = wifi_.initialize();
+#if CONFIG_CONTROL_WEB_SERIAL_CONFIGURATOR
+        const esp_err_t configSerialErr = control_config_serial_init();
+        if (configSerialErr == ESP_OK) {
+            const esp_err_t webErr = control_config_web_init();
+            if (webErr != ESP_OK) ESP_LOGW("CONTROL_CONFIG_WEB", "server_start_failed err=%s", esp_err_to_name(webErr));
+        }
+#endif
         ESP_LOGI("CONTROL_HEAP", "task_stack_config name=matter_worker size=%u priority=%u",
                  static_cast<unsigned>(MATTER_COMMISSIONING_WORKER_STACK_SIZE),
                  static_cast<unsigned>(MATTER_COMMISSIONING_WORKER_PRIORITY));
-        ESP_LOGI("CONTROL_HEAP", "task_stack_config name=matter_discovery size=%u priority=%u", 16384U, 7U);
-        ESP_LOGI("CONTROL_HEAP", "task_stack_config name=matter_command size=%u priority=%u", 12288U, 7U);
+        ESP_LOGI("CONTROL_HEAP", "task_stack_config name=matter_discovery size=%u priority=%u", 16384U, 2U);
+        ESP_LOGI("CONTROL_HEAP", "task_stack_config name=matter_command size=%u priority=%u", 6144U, 2U);
         ESP_LOGI("CONTROL_HEAP", "task_stack_config name=ui size=%d priority=%u",
                  CONFIG_ESP_MAIN_TASK_STACK_SIZE, static_cast<unsigned>(UI_TASK_PRIORITY));
         ESP_LOGI("CONTROL_HEAP", "task_stack_config name=display size=inline priority=%u",
@@ -227,6 +237,9 @@ public:
                 const esp_err_t configErr = control_ui_config_load(uiConfig);
                 if (configErr == ESP_OK && uiConfig.binding_count != 0) {
                     controlUi_.bindPersistedDevices(cached.savedNode.node_id, cached.devices, uiConfig);
+                    startupDeviceRefreshPending_ = true;
+                    ESP_LOGI("CONTROL_UI", "startup_device_refresh deferred=after_first_render cached_devices=%u",
+                             static_cast<unsigned>(cached.devices.size()));
                 } else {
 #if CONFIG_CONTROL_UI_DEVICE_ONBOARDING
                     controlUi_.beginOnboarding();
@@ -275,12 +288,24 @@ public:
 
     void runRecoveryIdleLoop() {
         while (true) {
+            if (startupDeviceRefreshPending_) {
+                startupDeviceRefreshPending_ = false;
+                const esp_err_t discoveryErr = matter_controller_start_device_discovery();
+                ESP_LOGI("CONTROL_UI", "startup_device_refresh result=%s",
+                         esp_err_to_name(discoveryErr));
+            }
             processWifi();
 #if !CONFIG_CONTROL_RECOVERY_BUILD
             processIkea();
             processMatter();
 #endif
             processWeather();
+#if CONFIG_CONTROL_UI_DASHBOARD_V1
+            if (dashboardAvailable_ && state_ == AppState::WEATHER_HOME &&
+                !matterCommissioningUiQuiet_.load() && esp_timer_get_time() >= nextBatteryReadUs_) {
+                renderUi("battery_status");
+            }
+#endif
             processTimeouts();
             processPendingRender();
             processTouchEvents();
@@ -298,7 +323,7 @@ public:
             if (event.type != TouchEventType::NONE && touchQueue_ != nullptr) {
                 (void)xQueueSend(touchQueue_, &event, 0);
             }
-            vTaskDelay(pdMS_TO_TICKS(5));
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
 
@@ -402,18 +427,21 @@ private:
         }
         ESP_LOGI("CONTROL_UI", "render reason=%s state=%s",
                  reason ? reason : "unspecified", appStateName(state_));
+        bool ok;
 #if CONFIG_CONTROL_UI_DASHBOARD_V1
         if (dashboardAvailable_ && state_ == AppState::WEATHER_HOME) {
             updateControlUiContext();
-            return controlUi_.render(reason && std::strcmp(reason, "screen_enter") == 0);
-        }
+            ok = controlUi_.render(false);
+        } else
 #endif
-        const bool ok = ui_.render(viewModel());
-        if (!ok && display_.busy()) {
+        {
+            ok = ui_.render(viewModel());
+        }
+        if (!ok && display_.available()) {
             pendingRender_ = true;
             pendingRenderState_ = state_;
             pendingRenderReason_ = reason ? reason : "unspecified";
-            ESP_LOGI("CONTROL_UI", "render_deferred reason=display_busy state=%s",
+            ESP_LOGI("CONTROL_UI", "render_deferred reason=refresh_failed state=%s",
                      appStateName(state_));
         } else if (ok) {
             pendingRender_ = false;
@@ -425,11 +453,11 @@ private:
         ESP_LOGI("CONTROL_UI", "render reason=%s state=%s quiet_override=yes",
                  reason ? reason : "unspecified", appStateName(state_));
         const bool ok = ui_.render(viewModel());
-        if (!ok && display_.busy()) {
+        if (!ok && display_.available()) {
             pendingRender_ = true;
             pendingRenderState_ = state_;
             pendingRenderReason_ = reason ? reason : "unspecified";
-            ESP_LOGI("CONTROL_UI", "render_deferred reason=display_busy state=%s",
+            ESP_LOGI("CONTROL_UI", "render_deferred reason=refresh_failed state=%s",
                      appStateName(state_));
         } else if (ok) {
             pendingRender_ = false;
@@ -635,16 +663,22 @@ private:
 #if CONFIG_CONTROL_RECOVERY_BUILD
         return;
 #else
+#if CONFIG_CONTROL_UI_DASHBOARD_V1
         processControlUiMatterResults();
-#if CONFIG_CONTROL_UI_DASHBOARD_V1 && CONFIG_CONTROL_UI_DEVICE_ONBOARDING
-        if (dashboardAvailable_) {
-            MatterDiscoveryResult discovery;
-            if (matter_controller_get_discovery_result(discovery) == ESP_OK &&
-                controlUi_.updateDiscovery(discovery) && state_ == AppState::WEATHER_HOME) {
-                if (discovery.phase == MatterDiscoveryPhase::COMPLETE) {
-                    matter_controller_log_ui_endpoints(discovery);
-                }
-                renderUi("matter_discovery_progress");
+#endif
+#if CONFIG_CONTROL_UI_DASHBOARD_V1
+        MatterDiscoveryResult discovery;
+        const bool discoveryChanged = dashboardAvailable_ &&
+            matter_controller_get_discovery_result(discovery) == ESP_OK &&
+            controlUi_.updateDiscovery(discovery);
+        bool discoveryBound = false;
+        if (discoveryChanged && discovery.phase == MatterDiscoveryPhase::COMPLETE) {
+            MatterPostCommissioningResult refreshed;
+            if (matter_controller_load_device_cache(refreshed) == ESP_OK) {
+                matterPostResult_ = refreshed;
+                bindControlUiMatter(refreshed);
+                discoveryBound = true;
+                matter_controller_log_ui_endpoints(discovery);
             }
         }
 #endif
@@ -658,16 +692,15 @@ private:
             matterPostResult_ = post;
             matterSavedNode_ = post.savedNode;
 #if CONFIG_CONTROL_UI_DASHBOARD_V1
-            if (post.status == MatterPostCommissioningStatus::DEVICE_LIST) bindControlUiMatter(post);
+            if (post.status == MatterPostCommissioningStatus::DEVICE_LIST && !discoveryBound) bindControlUiMatter(post);
 #endif
             switch (post.status) {
                 case MatterPostCommissioningStatus::DEVICE_DISCOVERY:
-                    if (!(dashboardAvailable_ && controlUi_.onboardingActive()) &&
-                        state_ != AppState::MATTER_DEVICE_DISCOVERY) transition(AppState::MATTER_DEVICE_DISCOVERY);
+                    if (!dashboardAvailable_ && state_ != AppState::MATTER_DEVICE_DISCOVERY) transition(AppState::MATTER_DEVICE_DISCOVERY);
                     break;
                 case MatterPostCommissioningStatus::DEVICE_LIST:
                     normalizeMatterSelection();
-                    if (!(dashboardAvailable_ && controlUi_.onboardingActive())) transition(AppState::MATTER_DEVICE_LIST);
+                    if (!dashboardAvailable_) transition(AppState::MATTER_DEVICE_LIST);
                     break;
                 case MatterPostCommissioningStatus::COMMAND_IN_PROGRESS:
                     if (batchCommandActive_) {
@@ -689,10 +722,10 @@ private:
                     transition(AppState::MATTER_COMMAND_FAILED);
                     break;
                 case MatterPostCommissioningStatus::CONNECTION_FAILED:
-                    if (!(dashboardAvailable_ && controlUi_.onboardingActive())) transition(AppState::MATTER_CONNECTION_FAILED);
+                    if (!(dashboardAvailable_ && (state_ == AppState::WEATHER_HOME || controlUi_.onboardingActive()))) transition(AppState::MATTER_CONNECTION_FAILED);
                     break;
                 case MatterPostCommissioningStatus::DISCOVERY_FAILED:
-                    if (!(dashboardAvailable_ && controlUi_.onboardingActive())) transition(AppState::MATTER_DISCOVERY_FAILED);
+                    if (!(dashboardAvailable_ && (state_ == AppState::WEATHER_HOME || controlUi_.onboardingActive()))) transition(AppState::MATTER_DISCOVERY_FAILED);
                     break;
                 case MatterPostCommissioningStatus::SAVED_NODE_INVALID:
                     transition(AppState::MATTER_SAVED_INVALID);
@@ -706,6 +739,13 @@ private:
             matterPostResult_ = post;
             matterSavedNode_ = post.savedNode;
         }
+#if CONFIG_CONTROL_UI_DASHBOARD_V1
+        if (discoveryChanged && state_ == AppState::WEATHER_HOME &&
+            (discovery.phase == MatterDiscoveryPhase::COMPLETE ||
+             discovery.phase == MatterDiscoveryPhase::FAILED)) {
+            renderUi("matter_discovery_finished");
+        }
+#endif
         if (state_ != AppState::MATTER_COMMISSIONING) return;
         MatterCommissioningResult result;
         (void)matter_controller_get_last_result(result);
@@ -784,31 +824,24 @@ private:
     }
 
     void processPendingRender() {
-        if (!pendingRender_ || display_.busy()) return;
+        if (!pendingRender_ || display_.busy() || matterCommissioningUiQuiet_.load()) return;
         ESP_LOGI("CONTROL_UI", "render_pending_start state=%s reason=%s",
                  appStateName(pendingRenderState_),
                  pendingRenderReason_ ? pendingRenderReason_ : "unspecified");
+        const bool ok = renderUi(pendingRenderReason_);
         pendingRender_ = false;
-#if CONFIG_CONTROL_UI_DASHBOARD_V1
-        if (dashboardAvailable_ && state_ == AppState::WEATHER_HOME) {
-            updateControlUiContext();
-            (void)controlUi_.render(false);
-            return;
-        }
-#endif
-        const bool ok = ui_.render(viewModel());
-        if (!ok && display_.busy()) {
-            pendingRender_ = true;
-            pendingRenderState_ = state_;
-            ESP_LOGI("CONTROL_UI", "render_deferred reason=display_busy state=%s",
-                     appStateName(state_));
-        }
+        if (!ok) ESP_LOGW("CONTROL_UI", "render_retry_stopped state=%s", appStateName(state_));
     }
 
 #if CONFIG_CONTROL_UI_DASHBOARD_V1
     void bindControlUiMatter(const MatterPostCommissioningResult &result) {
         matter_controller_log_ui_endpoints(result);
-        controlUi_.bindMatterDevices(result.savedNode.node_id, result.devices);
+        UiConfig config;
+        if (dashboardAvailable_ && control_ui_config_load(config) == ESP_OK && config.binding_count != 0) {
+            controlUi_.bindPersistedDevices(result.savedNode.node_id, result.devices, config);
+        } else {
+            controlUi_.bindMatterDevices(result.savedNode.node_id, result.devices);
+        }
 #if CONFIG_CONTROL_UI_MATTER_COMMANDS
         const esp_err_t err = matter_controller_ui_init();
         if (err != ESP_OK) {
@@ -819,12 +852,35 @@ private:
 
     void processControlUiMatterResults() {
 #if CONFIG_CONTROL_UI_MATTER_COMMANDS
-        if (!dashboardAvailable_) return;
         MatterUiResult result;
         bool changed = false;
         while (matter_controller_ui_poll_result(result)) {
-            controlUi_.completeMatterCommand(result);
-            changed = true;
+            if (result.command.ui_device_id == CONTROL_CONFIG_UI_DEVICE_MARKER) {
+                control_config_serial_handle_matter_result(result);
+            } else if (dashboardAvailable_) {
+                changed |= controlUi_.completeMatterCommand(result);
+            }
+        }
+        if (control_config_serial_take_config_update()) {
+            const uint32_t activeConfigId = control_config_serial_take_active_config_id();
+            MatterPostCommissioningResult cached;
+            if (matter_controller_load_device_cache(cached) == ESP_OK) {
+                matterPostResult_ = cached;
+                UiConfig config;
+                if (control_ui_config_load(config) == ESP_OK && dashboardAvailable_) {
+                    controlUi_.bindPersistedDevices(cached.savedNode.node_id, cached.devices, config);
+                    ESP_LOGI("CONTROL_CONFIG", "active_config_updated id=%u rooms=%u devices=%u",
+                             static_cast<unsigned>(activeConfigId), static_cast<unsigned>(config.room_count),
+                             static_cast<unsigned>(config.binding_count));
+                    ESP_LOGI("CONTROL_UI", "config_updated");
+                    if (state_ == AppState::WEATHER_HOME) renderUi("config_updated");
+                } else if (dashboardAvailable_) {
+#if CONFIG_CONTROL_UI_DEVICE_ONBOARDING
+                    controlUi_.beginOnboarding();
+                    if (state_ == AppState::WEATHER_HOME) renderUi("config_updated");
+#endif
+                }
+            }
         }
         if (changed && state_ == AppState::WEATHER_HOME) renderUi("matter_ui_command_complete");
 #endif
@@ -837,7 +893,11 @@ private:
         if (now != static_cast<time_t>(-1) && localtime_r(&now, &calendar) != nullptr) {
             strftime(clockText, sizeof(clockText), "%H:%M", &calendar);
         }
-        controlUi_.setContext(wifi_.isConnected(), clockText);
+        if (esp_timer_get_time() >= nextBatteryReadUs_) {
+            nextBatteryReadUs_ = esp_timer_get_time() + 60LL * 1000 * 1000;
+            batteryPercent_ = control_battery_percent();
+        }
+        controlUi_.setContext(wifi_.isConnected(), clockText, batteryPercent_);
     }
 #endif
 
@@ -897,9 +957,10 @@ private:
         }
 #if CONFIG_CONTROL_UI_DASHBOARD_V1
         if (dashboardAvailable_ && state_ == AppState::WEATHER_HOME) {
-            if (controlUi_.handleTouch(event)) {
-                updateControlUiContext();
-                (void)controlUi_.render(false);
+            const bool handled = controlUi_.handleTouch(event);
+            if (event.type == TouchEventType::RELEASE) nextBatteryReadUs_ = 0;
+            if (handled || event.type == TouchEventType::RELEASE) {
+                (void)renderUi("touch");
             }
             return;
         }
@@ -1660,10 +1721,11 @@ private:
     MatterOnboarding matter_;
     IkeaDiscovery ikea_;
     UiManager ui_;
-#if CONFIG_CONTROL_UI_DASHBOARD_V1
     ControlUi controlUi_;
     bool dashboardAvailable_ = false;
-#endif
+    int batteryPercent_ = -1;
+    int64_t nextBatteryReadUs_ = 0;
+    bool startupDeviceRefreshPending_ = false;
     std::string selectedSsid_;
     std::string password_;
     std::string savedSsid_;

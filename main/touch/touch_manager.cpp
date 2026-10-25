@@ -49,6 +49,7 @@ const char *touchEventName(TouchEventType type) {
         case TouchEventType::PRESS: return "PRESS";
         case TouchEventType::MOVE: return "MOVE";
         case TouchEventType::RELEASE: return "RELEASE";
+        case TouchEventType::CANCEL: return "CANCEL";
     }
     return "UNKNOWN";
 }
@@ -274,6 +275,7 @@ void TouchManager::transformCoordinates(int rawX, int rawY, int &x, int &y) cons
 TouchEvent TouchManager::makeEvent(TouchEventType type, const TouchSample *sample) {
     TouchEvent event;
     event.type = type;
+    event.timestampUs = esp_timer_get_time();
     event.irqLevel = gpio_get_level(CONTROL_BOARD_TOUCH_IRQ);
     lastIrqLevel_ = event.irqLevel;
     if (sample != nullptr) {
@@ -365,8 +367,8 @@ TouchEvent TouchManager::poll() {
     if (contactActive_ && (definitiveRelease || staleContact)) {
         contactActive_ = false;
         internalState_ = TouchInternalState::RELEASED;
-        // No stale coordinates are attached to RELEASE.
-        return makeEvent(TouchEventType::RELEASE, nullptr);
+        // Missing samples cannot confirm a finger lift or activate a button.
+        return makeEvent(definitiveRelease ? TouchEventType::RELEASE : TouchEventType::CANCEL, nullptr);
     }
     return {};
 }

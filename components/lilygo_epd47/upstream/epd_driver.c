@@ -73,7 +73,7 @@ static void write_row(uint32_t output_time_dus);
 /**
  * @brief skip a display row
  */
-static void skip_row(uint8_t pipeline_finish_time);
+static void skip_row(uint32_t pipeline_finish_time);
 
 static void IRAM_ATTR reset_lut(uint8_t *lut_mem, DrawMode_t mode);
 
@@ -115,6 +115,15 @@ static const int32_t contrast_cycles_4_white[15] = {10, 10, 8, 8, 8, 8, 8, 10, 1
 // is calculated for each cycle.
 static uint8_t *conversion_lut;
 static QueueHandle_t output_queue;
+static BaseType_t display_core;
+
+// FreeRTOS queue storage is allocated from internal RAM. Matter leaves less
+// than 31 KiB contiguous there, so the historical 64-row queue cannot be
+// created on the controller build even though the framebuffer and LUT live in
+// PSRAM. A short queue still provides producer/consumer buffering without
+// consuming the display's remaining internal heap.
+#define EPD_OUTPUT_QUEUE_LENGTH 8
+#define EPD_RENDER_TASK_STACK_WORDS 2048
 
 static const DRAM_ATTR uint32_t lut_1bpp[256] = {
     0x0000, 0x0001, 0x0004, 0x0005, 0x0010, 0x0011, 0x0014, 0x0015,
@@ -160,10 +169,11 @@ esp_err_t epd_init(void)
     skipping = 0;
     esp_err_t err = epd_base_init(EPD_WIDTH);
     if (err != ESP_OK) return err;
+    display_core = xPortGetCoreID();
 
     conversion_lut = (uint8_t *)heap_caps_malloc(1 << 16, MALLOC_CAP_8BIT);
     if (conversion_lut == NULL) return ESP_ERR_NO_MEM;
-    output_queue = xQueueCreate(64, EPD_WIDTH / 2);
+    output_queue = xQueueCreate(EPD_OUTPUT_QUEUE_LENGTH, EPD_WIDTH / 2);
     if (output_queue == NULL) {
         heap_caps_free(conversion_lut);
         conversion_lut = NULL;
@@ -183,7 +193,9 @@ void epd_push_pixels(Rect_t area, int16_t time, int32_t color)
         uint8_t mask = (color ? CLEAR_BYTE : DARK_BYTE) & (0b00000011 << (2 * (position % 4)));
         row[area.x / 4 + position / 4] |= mask;
     }
+#if USER_I2S_REG
     reorder_line_buffer((uint32_t *)row);
+#endif
 
     epd_start_frame();
 
@@ -192,7 +204,7 @@ void epd_push_pixels(Rect_t area, int16_t time, int32_t color)
         // before are of interest: skip
         if (i < area.y)
         {
-            skip_row(time);
+            skip_row(time * 10);
             // start area of interest: set row data
         }
         else if (i == area.y)
@@ -207,7 +219,7 @@ void epd_push_pixels(Rect_t area, int16_t time, int32_t color)
         }
         else if (i >= area.y + area.height)
         {
-            skip_row(time);
+            skip_row(time * 10);
             // output the same as before
         }
         else
@@ -725,9 +737,9 @@ void epd_copy_to_framebuffer(Rect_t image_area, uint8_t *image_data,
 }
 
 
-void IRAM_ATTR epd_draw_grayscale_image(Rect_t area, uint8_t *data)
+esp_err_t IRAM_ATTR epd_draw_grayscale_image(Rect_t area, uint8_t *data)
 {
-    epd_draw_image(area, data, BLACK_ON_WHITE);
+    return epd_draw_image(area, data, BLACK_ON_WHITE);
 }
 
 
@@ -820,12 +832,20 @@ void IRAM_ATTR epd_draw_frame_1bit(Rect_t area, uint8_t *ptr,
 }
 
 
-void IRAM_ATTR epd_draw_image(Rect_t area, uint8_t *data, DrawMode_t mode)
+esp_err_t IRAM_ATTR epd_draw_image(Rect_t area, uint8_t *data, DrawMode_t mode)
 {
     uint8_t frame_count = 15;
 
     SemaphoreHandle_t fetch_sem = xSemaphoreCreateBinary();
     SemaphoreHandle_t feed_sem = xSemaphoreCreateBinary();
+    if (!fetch_sem || !feed_sem) {
+        if (fetch_sem) vSemaphoreDelete(fetch_sem);
+        if (feed_sem) vSemaphoreDelete(feed_sem);
+        ESP_LOGE("epd_driver", "render semaphore allocation failed");
+        return ESP_ERR_NO_MEM;
+    }
+    esp_err_t result = ESP_OK;
+    // Keep the factory settling interval before the grayscale waveform.
     vTaskDelay(10);
     for (uint8_t k = 0; k < frame_count; k++)
     {
@@ -844,11 +864,23 @@ void IRAM_ATTR epd_draw_image(Rect_t area, uint8_t *data, DrawMode_t mode)
             .done_smphr = feed_sem,
         };
 
-        TaskHandle_t t1, t2;
-        xTaskCreatePinnedToCore((void (*)(void *))provide_out, "privide_out", 8192,
-                                &p1, 10, &t1, 0);
-        xTaskCreatePinnedToCore((void (*)(void *))feed_display, "render", 8192, &p2,
-                                10, &t2, 1);
+        TaskHandle_t t1 = NULL, t2 = NULL;
+        const BaseType_t fetch_result = xTaskCreatePinnedToCore(
+            (void (*)(void *))provide_out, "privide_out", EPD_RENDER_TASK_STACK_WORDS,
+            &p1, 10, &t1, 0);
+        const BaseType_t feed_result = fetch_result == pdPASS ? xTaskCreatePinnedToCore(
+            (void (*)(void *))feed_display, "render", EPD_RENDER_TASK_STACK_WORDS,
+            // The ISR must finish cleanup before its awakened row feeder runs.
+            &p2, 10, &t2, display_core) : pdFAIL;
+        if (fetch_result != pdPASS || feed_result != pdPASS) {
+            ESP_LOGE("epd_driver", "render task creation failed fetch=%ld feed=%ld",
+                     (long)fetch_result, (long)feed_result);
+            if (fetch_result == pdPASS) vTaskDelete(t1);
+            if (feed_result == pdPASS) vTaskDelete(t2);
+            xQueueReset(output_queue);
+            result = ESP_ERR_NO_MEM;
+            break;
+        }
 
         xSemaphoreTake(fetch_sem, portMAX_DELAY);
         xSemaphoreTake(feed_sem, portMAX_DELAY);
@@ -859,6 +891,7 @@ void IRAM_ATTR epd_draw_image(Rect_t area, uint8_t *data, DrawMode_t mode)
     }
     vSemaphoreDelete(fetch_sem);
     vSemaphoreDelete(feed_sem);
+    return result;
 }
 
 /******************************************************************************/
@@ -877,7 +910,7 @@ static void write_row(uint32_t output_time_dus)
 }
 
 
-static void skip_row(uint8_t pipeline_finish_time)
+static void skip_row(uint32_t pipeline_finish_time)
 {
     // output previously loaded row, fill buffer with no-ops.
     if (skipping == 0)
@@ -1070,7 +1103,7 @@ static void IRAM_ATTR provide_out(OutputParams *params)
             memset(line, 255, EPD_WIDTH / 2);
         }
     }
-    vTaskDelay((const TickType_t )5);
+    vTaskDelay(5);
     xSemaphoreGive(params->done_smphr);
     vTaskDelay(portMAX_DELAY);
 }

@@ -6,7 +6,7 @@
 #include "driver/i2c_master.h"
 #include "esp_attr.h"
 
-enum class TouchEventType { NONE, PRESS, MOVE, RELEASE };
+enum class TouchEventType { NONE, PRESS, MOVE, RELEASE, CANCEL };
 enum class TouchInternalState { IDLE, PRESSED, MOVING, RELEASED };
 
 const char *touchEventName(TouchEventType type);
@@ -21,6 +21,7 @@ struct TouchEvent {
     int x = -1;
     int y = -1;
     int irqLevel = -1;
+    int64_t timestampUs = 0;
 };
 
 struct TouchDiagnostics {

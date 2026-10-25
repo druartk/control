@@ -26,8 +26,8 @@
 #if !CONFIG_SPIRAM_MODE_OCT || !CONFIG_SPIRAM_SPEED_80M
 #error "T5 4.7 Plus V2.4 requires the R8 configuration: 8 MB OPI PSRAM at 80 MHz"
 #endif
-#if !CONFIG_ESP_CONSOLE_USB_CDC
-#error "Control expects the V2.4 native USB connector as the primary CDC console"
+#if !CONFIG_ESP_CONSOLE_USB_CDC && !CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+#error "Control expects the V2.4 native USB connector as the primary USB console"
 #endif
 
 #define CONTROL_BOARD_NAME              "LILYGO T5 4.7 Plus"
@@ -97,7 +97,7 @@
 #define CONTROL_BOARD_TOUCH_INVERT_X     0
 #define CONTROL_BOARD_TOUCH_INVERT_Y     1
 
-/* Confirmed auxiliary signals; not enabled by this milestone. */
+/* Confirmed auxiliary signals. Battery sensing uses a 100 kOhm / 100 kOhm divider. */
 #define CONTROL_BOARD_BATTERY_ADC        GPIO_NUM_14
 #define CONTROL_BOARD_BUTTON             GPIO_NUM_21
 #define CONTROL_BOARD_BOOT               GPIO_NUM_0

@@ -45,7 +45,9 @@ set(CONTROL_MAIN_REQUIRES
     esp_app_format
     esp_netif
     esp_timer
+    esp_adc
     esp_http_client
+    esp_http_server
     json
     esp_wifi
     lwip
@@ -84,17 +86,26 @@ idf_component_register(
         "wifi/wifi_manager.cpp"
         "system/control_heap.cpp"
         "system/control_time.cpp"
+        "system/control_battery.cpp"
         "weather/weather_manager.cpp"
         "ikea/ikea_discovery.cpp"
         "matter/matter_controller.cpp"
         "matter/matter_pairing_code.cpp"
         "storage/settings_store.cpp"
         "storage/ui_config.cpp"
+        "config/control_config_serial.cpp"
+        "config/control_config_web.cpp"
         "matter/matter_onboarding.cpp"
     INCLUDE_DIRS "."
     PRIV_INCLUDE_DIRS ${CONTROL_MAIN_PRIV_INCLUDE_DIRS}
     REQUIRES ${CONTROL_MAIN_REQUIRES}
     LDFRAGMENTS ${CONTROL_MAIN_LDFRAGMENTS})
+
+foreach(ASSET_FILE index.html app.js model.js protocol.js wifi.js style.css)
+    string(REPLACE "." "_" ASSET_NAME "${ASSET_FILE}")
+    target_add_binary_data(${COMPONENT_LIB} "${CMAKE_SOURCE_DIR}/tools/configurator/${ASSET_FILE}" TEXT
+        RENAME_TO "control_web_${ASSET_NAME}")
+endforeach()
 
 if(NOT CONTROL_MAIN_RECOVERY)
     target_sources(${COMPONENT_LIB} PRIVATE "network/mdns_manager.cpp")

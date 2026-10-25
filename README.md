@@ -340,13 +340,16 @@ Classification :
   physiquement observée ;
 - `T_RST` et l'alimentation tactile n'ont pas de GPIO S3 confirmé et restent
   volontairement inutilisés ;
-- la lecture batterie est documentée sur GPIO14 mais non activée. ADC2 doit
-  être validé avec le Wi-Fi actif avant tout futur module batterie ;
+- la batterie est mesurée sur GPIO14 avec l'ADC calibré et le pont 100 kΩ / 100 kΩ.
+  L'accueil affiche une icône et un pourcentage estimé par tension, par pas de 5 %,
+  actualisé chaque minute. Une lecture indisponible affiche `--%`.
+  Ce pourcentage reste approximatif, notamment pendant la charge USB ;
 - les changements d'écran et actions de clavier utilisent encore un plein
   rafraîchissement. L'abstraction est prête pour une politique de zones
   partielles, mais celle-ci doit être caractérisée sur la dalle réelle pour
-  limiter ghosting et usure. `CONFIG_CONTROL_ENABLE_PARTIAL_REFRESH` reste
-  désactivé ; `commitRegion()` journalise et ignore la demande pour l'instant ;
+  limiter ghosting et usure. Le profil Matter stable garde les rafraîchissements
+  complets pour toutes les actions tant que les zones partielles ne sont pas
+  validées sur la dalle réelle ;
 - les réseaux masqués sont indiqués clairement mais la saisie manuelle de leur
   SSID est reportée ;
 - les identifiants NVS ne sont pas encore chiffrés par flash encryption ;

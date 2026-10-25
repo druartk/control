@@ -36,11 +36,19 @@ extern "C" {
 /******************************************************************************/
 
 /**
- * @brief Initializes RMT Channel 0 with a pin for RMT pulsing.
+ * @brief Initializes RMT Channel 1 with a pin for RMT pulsing.
  *
  * @note The pin will have to be re-initialized if subsequently used as GPIO.
  */
 esp_err_t rmt_pulse_init(gpio_num_t pin);
+
+/** Wait for CKV before changing the panel latch or frame control signals. */
+void IRAM_ATTR pulse_ckv_wait();
+
+/** Prepare outside the critical section, start without RTOS calls, then finish outside. */
+void pulse_ckv_prepare_frame_start();
+void IRAM_ATTR pulse_ckv_start_frame();
+void IRAM_ATTR pulse_ckv_finish_frame_start();
 
 /**
  * @brief Outputs a single pulse (high -> low) on the configured pin.

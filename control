@@ -1,0 +1,443 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+canonical_project_path() {
+    local value="$1" lower root_lower
+    root_lower='/mnt/c/users/k/documents/arduino/control'
+    lower="${value,,}"
+    if [[ "$lower" == "$root_lower"* ]]; then
+        printf '/mnt/c/Users/K/Documents/Arduino/control%s\n' "${value:${#root_lower}}"
+    else
+        printf '%s\n' "$value"
+    fi
+}
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+PROJECT_ROOT="$(canonical_project_path "$SCRIPT_DIR")"
+DEV_CONTROL="$PROJECT_ROOT/tools/dev/control.sh"
+CONFIGURATOR_DIR="$PROJECT_ROOT/tools/configurator"
+
+CONTROL_IDF_EXPORT_DEFAULT='/home/k/esp/esp-idf-v5.4.2/export.sh'
+CONTROL_MATTER_EXPORT_DEFAULT='/home/k/esp/esp-matter/export.sh'
+CONTROL_BUILD_DIR_DEFAULT='build_matter_stable'
+ESP32_VID_PID='303a:1001'
+ESP32_USB_IDENTITIES=('303a:1001' '303a:0009')
+
+USBIPD_LIST=''
+USBIPD_LINE=''
+USBIPD_BUSID_VALUE=''
+USBIPD_STATE='unknown'
+USBIPD_IDENTITY=''
+WINDOWS_ESPTOOL_COMMAND=''
+
+is_usbipd_list() {
+    grep -Eq '(^|[[:space:]])BUSID[[:space:]]+VID:PID|^[[:space:]]*[0-9]+-[0-9]+[[:space:]]+[[:xdigit:]]{4}:[[:xdigit:]]{4}([[:space:]]|$)'
+}
+
+die() {
+    printf 'CONTROL_CLI: ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+load_local_environment() {
+    local file="$PROJECT_ROOT/tools/dev/control.local.env"
+    [[ -f "$file" ]] || return 0
+    local -a names=(CONTROL_IDF_EXPORT CONTROL_MATTER_EXPORT CONTROL_BUILD_DIR
+        CONTROL_PORT CONTROL_USBIPD_AUTO_ATTACH CONTROL_USBIPD_BUSID
+        CONTROL_USBIPD_VID CONTROL_USBIPD_PID CONTROL_USB_WAIT_SECONDS
+        CONTROL_DIAG_SECONDS CONTROL_FLASH_TRANSPORT CONTROL_WINDOWS_ESPTOOL)
+    local name value
+    declare -A saved=()
+    for name in "${names[@]}"; do
+        if [[ -v "$name" ]]; then
+            saved["$name"]="${!name}"
+        fi
+    done
+    set +u
+    # shellcheck disable=SC1090
+    source "$file"
+    set -u
+    for name in "${!saved[@]}"; do
+        value="${saved[$name]}"
+        printf -v "$name" '%s' "$value"
+    done
+}
+
+usage() {
+    cat <<'EOF'
+Usage:
+  ./control build
+  ./control flash
+  ./control flash-diag
+  ./control monitor
+  ./control diag
+  ./control ui
+  ./control status
+  ./control clean
+  ./control help
+
+Commands:
+  build       Build the ESP32-S3 firmware.
+  flash       Build and flash through the Windows COM workflow.
+  flash-diag  Flash, reattach USB to WSL, and run diagnostics.
+  monitor     Attach USB to WSL and launch the ESP-IDF monitor.
+  diag        Capture the existing diagnostic monitor report.
+  ui          Serve the dependency-free Web Serial configurator.
+  status      Show concise project, firmware, USB, and tool state.
+  clean       Confirm, remove the safe build outputs, and rebuild.
+  help        Show this help.
+EOF
+}
+
+require_no_args() {
+    local label="$1"
+    shift
+    (($# == 0)) || die "$label takes no arguments"
+}
+
+configure_environment() {
+    export CONTROL_IDF_EXPORT="${CONTROL_IDF_EXPORT:-$CONTROL_IDF_EXPORT_DEFAULT}"
+    export CONTROL_MATTER_EXPORT="${CONTROL_MATTER_EXPORT:-$CONTROL_MATTER_EXPORT_DEFAULT}"
+    export CONTROL_BUILD_DIR="${CONTROL_BUILD_DIR:-$CONTROL_BUILD_DIR_DEFAULT}"
+    local name
+    local -a passthrough=(CONTROL_PORT CONTROL_USBIPD_AUTO_ATTACH CONTROL_USBIPD_BUSID
+        CONTROL_USBIPD_VID CONTROL_USBIPD_PID CONTROL_USB_WAIT_SECONDS
+        CONTROL_DIAG_SECONDS CONTROL_FLASH_TRANSPORT CONTROL_WINDOWS_ESPTOOL)
+    for name in "${passthrough[@]}"; do
+        if [[ -v "$name" ]]; then
+            export "$name"
+        fi
+    done
+}
+
+usbipd_list() {
+    local output
+    if command -v usbipd.exe >/dev/null 2>&1; then
+        output="$(usbipd.exe list 2>&1)"
+        if ! is_usbipd_list <<<"$output"; then
+            output=''
+        fi
+    elif command -v usbipd >/dev/null 2>&1; then
+        output="$(usbipd list 2>&1)"
+        if ! is_usbipd_list <<<"$output"; then
+            output=''
+        fi
+    fi
+    if [[ -z "$output" ]] && command -v powershell.exe >/dev/null 2>&1; then
+        output="$(powershell.exe -NoProfile -NonInteractive -Command 'usbipd.exe list' 2>&1)"
+    fi
+    USBIPD_LIST="${output//$'\r'/}"
+    is_usbipd_list <<<"$USBIPD_LIST"
+}
+
+usbipd_state_for_line() {
+    local line="$1"
+    if grep -Eiq 'Not[[:space:]]+shared' <<<"$line"; then
+        printf 'Not shared\n'
+    elif grep -Eiq '[[:space:]]Shared([[:space:]]|$)' <<<"$line"; then
+        printf 'Shared\n'
+    elif grep -Eiq '[[:space:]]Attached([[:space:]]|$)' <<<"$line"; then
+        printf 'Attached\n'
+    else
+        printf 'unknown\n'
+    fi
+}
+
+usbipd_line_for_busid() {
+    local busid="$1"
+    awk -v busid="$busid" '$1 == busid { print; exit }' <<<"$USBIPD_LIST"
+}
+
+control_usb_lines() {
+    local identity lines
+    if [[ -n "${CONTROL_USBIPD_PID:-}" ]]; then
+        awk -v target="${CONTROL_USBIPD_VID#0x}:${CONTROL_USBIPD_PID#0x}" 'tolower($2) == tolower(target) { print }' <<<"$USBIPD_LIST"
+        return
+    fi
+    for identity in "${ESP32_USB_IDENTITIES[@]}"; do
+        lines="$(awk -v target="$identity" 'tolower($2) == target { print }' <<<"$USBIPD_LIST")"
+        if [[ -n "$lines" ]]; then
+            printf '%s\n' "$lines"
+            return
+        fi
+    done
+}
+
+detect_usb_busid() {
+    local required="${1:-1}" line target
+    local -a matches=()
+
+    USBIPD_LINE=''
+    USBIPD_STATE='unknown'
+    USBIPD_BUSID_VALUE="${CONTROL_USBIPD_BUSID:-}"
+
+    if ! usbipd_list; then
+        if (( required )); then
+            die 'usbipd.exe list is unavailable'
+        fi
+        return 1
+    fi
+
+    if [[ -n "${CONTROL_USBIPD_BUSID:-}" ]]; then
+        USBIPD_BUSID_VALUE="$CONTROL_USBIPD_BUSID"
+        USBIPD_LINE="$(usbipd_line_for_busid "$USBIPD_BUSID_VALUE")"
+    elif [[ -n "${CONTROL_USBIPD_VID:-}" || -n "${CONTROL_USBIPD_PID:-}" ]]; then
+        [[ -n "${CONTROL_USBIPD_VID:-}" ]] || die 'set CONTROL_USBIPD_VID when overriding USB identity'
+        target="${CONTROL_USBIPD_VID#0x}:${CONTROL_USBIPD_PID#0x}"
+        target="${target,,}"
+        mapfile -t matches < <(control_usb_lines)
+        if (( ${#matches[@]} != 1 )); then
+            if (( ${#matches[@]} == 0 )); then
+                mapfile -t matches < <(awk '$1 ~ /^[0-9]+-[0-9]+$/ && tolower($0) ~ /(esp32|espressif|usb[ -]jtag|usb[ -]cdc|jtag\/serial)/ { print }' <<<"$USBIPD_LIST")
+            fi
+            if (( required )); then
+                printf '%s\n' "${matches[@]:-no matching device}" >&2
+                die "expected exactly one usbipd device with VID:PID $target"
+            fi
+            return 1
+        fi
+        USBIPD_LINE="${matches[0]}"
+        USBIPD_BUSID_VALUE="$(awk '{print $1}' <<<"$USBIPD_LINE")"
+    else
+        mapfile -t matches < <(control_usb_lines)
+        if (( ${#matches[@]} == 0 )); then
+            mapfile -t matches < <(awk '$1 ~ /^[0-9]+-[0-9]+$/ && tolower($0) ~ /(esp32|espressif|usb[ -]jtag|usb[ -]cdc|jtag\/serial)/ { print }' <<<"$USBIPD_LIST")
+        fi
+        if (( ${#matches[@]} == 0 )); then
+            if (( required )); then
+                die "no ESP32-S3 usbipd device found for VID:PID $ESP32_VID_PID"
+            fi
+            return 1
+        fi
+        if (( ${#matches[@]} > 1 )); then
+            if (( required )); then
+                printf 'CONTROL_CLI: ERROR: multiple ESP32-S3 usbipd devices found:\n' >&2
+                printf 'CONTROL_CLI: candidate=%s\n' "${matches[@]}" >&2
+                die 'set CONTROL_USBIPD_BUSID to select one'
+            fi
+            return 1
+        fi
+        USBIPD_LINE="${matches[0]}"
+        USBIPD_BUSID_VALUE="$(awk '{print $1}' <<<"$USBIPD_LINE")"
+    fi
+
+    [[ -n "$USBIPD_BUSID_VALUE" ]] || die 'USBIPD BUSID is empty'
+    USBIPD_STATE="$(usbipd_state_for_line "$USBIPD_LINE")"
+    USBIPD_IDENTITY="$(awk '{print tolower($2)}' <<<"$USBIPD_LINE")"
+    export CONTROL_USBIPD_BUSID="$USBIPD_BUSID_VALUE"
+    printf 'CONTROL_CLI: usbipd_busid=%s\n' "$USBIPD_BUSID_VALUE"
+}
+
+windows_quote() {
+    local value="$1"
+    if [[ "$value" == *' '* || "$value" == *'"'* ]]; then
+        value="${value//\\/\\\\}"
+        value="${value//\"/\\\"}"
+        printf '"%s"' "$value"
+    else
+        printf '%s' "$value"
+    fi
+}
+
+try_windows_esptool() {
+    local candidate="${1:-}" launcher_win output status executable line command
+    local -a args=()
+    command -v powershell.exe >/dev/null 2>&1 || return 1
+    command -v wslpath >/dev/null 2>&1 || return 1
+    launcher_win="$(wslpath -w "$PROJECT_ROOT/tools/dev/windows-esptool-flash.ps1" | tr -d '\r\n')"
+    [[ -n "$launcher_win" ]] || return 1
+    args=(-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$launcher_win"
+        -VersionOnly -Bootloader bootloader.bin
+        -PartitionTable partition-table.bin -Application application.bin)
+    [[ -n "$candidate" ]] && args+=( -ControlWindowsEsptool "$candidate" )
+
+    set +e
+    output="$(powershell.exe "${args[@]}" 2>&1)"
+    status=$?
+    set -e
+    (( status == 0 )) || return 1
+
+    executable="$(awk -F= '/^CONTROL_DEV: windows_esptool_executable=/{print substr($0, index($0, "=") + 1); exit}' <<<"$output")"
+    executable="${executable//$'\r'/}"
+    [[ -n "$executable" ]] || return 1
+    command="$(windows_quote "$executable")"
+    while IFS= read -r line; do
+        line="${line//$'\r'/}"
+        [[ -n "$line" ]] || continue
+        command+=" $(windows_quote "$line")"
+    done < <(sed -n 's/^CONTROL_DEV: windows_esptool_prefix_arg\[[0-9][0-9]*\]=//p' <<<"$output")
+    WINDOWS_ESPTOOL_COMMAND="$command"
+}
+
+resolve_windows_esptool() {
+    local explicit known
+    explicit="${CONTROL_WINDOWS_ESPTOOL:-}"
+    if [[ -n "$explicit" ]]; then
+        try_windows_esptool "$explicit" || die "CONTROL_WINDOWS_ESPTOOL failed esptool version validation"
+        export CONTROL_WINDOWS_ESPTOOL="$WINDOWS_ESPTOOL_COMMAND"
+        printf 'CONTROL_CLI: windows_esptool=%s\n' "$WINDOWS_ESPTOOL_COMMAND"
+        return 0
+    fi
+
+    known='C:\Users\K\AppData\Local\Programs\Python\Python314\python.exe -m esptool'
+    if ! try_windows_esptool "$known"; then
+        try_windows_esptool '' || die 'Windows esptool was not found or failed version validation'
+    fi
+    export CONTROL_WINDOWS_ESPTOOL="$WINDOWS_ESPTOOL_COMMAND"
+    printf 'CONTROL_CLI: windows_esptool=%s\n' "$WINDOWS_ESPTOOL_COMMAND"
+}
+
+prepare_hardware() {
+    local resolve_flash="${1:-0}"
+    configure_environment
+    detect_usb_busid
+    if (( resolve_flash )); then
+        resolve_windows_esptool
+    fi
+}
+
+run_dev_control() {
+    local command="$1"
+    shift
+    if [[ "${CONTROL_CLI_DRY_RUN:-0}" == '1' ]]; then
+        printf 'CONTROL_CLI: dispatch=%s %s\n' "$DEV_CONTROL" "$command"
+        return 0
+    fi
+    exec "$DEV_CONTROL" "$command" "$@"
+}
+
+flash_command() {
+    local command="$1"
+    run_dev_control "$command"
+}
+
+linux_serial_ports() {
+    { compgen -G '/dev/ttyACM*' || true; compgen -G '/dev/ttyUSB*' || true; } | sort -u
+}
+
+status_command() {
+    local build_dir="${CONTROL_BUILD_DIR:-$CONTROL_BUILD_DIR_DEFAULT}"
+    [[ "$build_dir" = /* ]] || build_dir="$PROJECT_ROOT/$build_dir"
+    build_dir="$(canonical_project_path "$build_dir")"
+    local binary="$build_dir/control.bin"
+    local idf_path="${CONTROL_IDF_EXPORT:-$CONTROL_IDF_EXPORT_DEFAULT}"
+    local matter_path="${CONTROL_MATTER_EXPORT:-$CONTROL_MATTER_EXPORT_DEFAULT}"
+    local firmware_timestamp='missing' serial='none' windows_port='none' esptool='unavailable'
+    idf_path="${idf_path%/export.sh}"
+    matter_path="${matter_path%/export.sh}"
+    configure_environment
+    if detect_usb_busid 0; then
+        if [[ -n "$USBIPD_LINE" ]]; then
+            windows_port="$(grep -Eo 'COM[0-9]+' <<<"$USBIPD_LINE" | tail -n 1 || true)"
+        fi
+        [[ -n "$windows_port" ]] || windows_port='none'
+    else
+        USBIPD_BUSID_VALUE="${CONTROL_USBIPD_BUSID:-none}"
+    fi
+    if [[ -n "$(linux_serial_ports)" ]]; then
+        serial="$(linux_serial_ports | paste -sd, -)"
+    fi
+    if try_windows_esptool "${CONTROL_WINDOWS_ESPTOOL:-}"; then
+        esptool="$WINDOWS_ESPTOOL_COMMAND"
+    elif [[ -n "${CONTROL_WINDOWS_ESPTOOL:-}" ]]; then
+        esptool="$CONTROL_WINDOWS_ESPTOOL"
+    fi
+    [[ -f "$binary" ]] && firmware_timestamp="$(stat -c '%y' "$binary")"
+    printf 'CONTROL_CLI: project_root=%s\n' "$PROJECT_ROOT"
+    printf 'CONTROL_CLI: idf_path=%s\n' "$idf_path"
+    printf 'CONTROL_CLI: esp_matter_path=%s\n' "$matter_path"
+    printf 'CONTROL_CLI: build_dir=%s\n' "$build_dir"
+    printf 'CONTROL_CLI: usbipd_busid=%s\n' "${USBIPD_BUSID_VALUE:-none}"
+    printf 'CONTROL_CLI: usbipd_state=%s\n' "${USBIPD_STATE:-unknown}"
+    printf 'CONTROL_CLI: usb_vidpid=%s\n' "${USBIPD_IDENTITY:-unknown}"
+    printf 'CONTROL_CLI: windows_port=%s\n' "$windows_port"
+    printf 'CONTROL_CLI: wsl_serial_port=%s\n' "$serial"
+    printf 'CONTROL_CLI: windows_esptool=%s\n' "$esptool"
+    printf 'CONTROL_CLI: firmware_binary=%s\n' "$binary"
+    printf 'CONTROL_CLI: firmware_timestamp=%s\n' "$firmware_timestamp"
+}
+
+ui_command() {
+    local port="${CONTROL_UI_PORT:-8080}"
+    [[ -d "$CONFIGURATOR_DIR" && -f "$CONFIGURATOR_DIR/index.html" && -f "$CONFIGURATOR_DIR/app.js" ]] || die 'configurator files are missing'
+    command -v python3 >/dev/null 2>&1 || die 'python3 is required for the configurator; install it without automatic setup'
+    [[ "$port" =~ ^[0-9]+$ && "$port" -le 65535 ]] || die 'CONTROL_UI_PORT must be a valid TCP port'
+    printf 'CONTROL_CLI: target=windows\n'
+    printf 'CONTROL_CLI: ui_url=http://localhost:%s\n' "$port"
+    if [[ "${CONTROL_CLI_DRY_RUN:-0}" == '1' ]]; then
+        printf 'CONTROL_CLI: ui_command=python3 -m http.server %s --bind 127.0.0.1\n' "$port"
+        return 0
+    fi
+    "$DEV_CONTROL" usb-release-ui
+    cd "$CONFIGURATOR_DIR"
+    exec python3 -m http.server "$port" --bind 127.0.0.1
+}
+
+clean_command() {
+    case "${1:-}" in
+        --yes)
+            (($# == 1)) || die 'clean --yes takes no other arguments'
+            configure_environment
+            exec "$DEV_CONTROL" clean-build --yes
+            ;;
+        '')
+            [[ -t 0 ]] || die 'clean requires interactive confirmation; use ./control clean --yes'
+            printf 'CONTROL_CLI: Remove build_matter_stable and rebuild? [y/N] '
+            read -r answer
+            [[ "$answer" == 'y' || "$answer" == 'Y' ]] || { printf 'CONTROL_CLI: clean=cancelled\n'; return 0; }
+            configure_environment
+            exec "$DEV_CONTROL" clean-build --yes
+            ;;
+        *)
+            die 'clean accepts only --yes'
+            ;;
+    esac
+}
+
+check_project_files() {
+    [[ -f "$DEV_CONTROL" ]] || die "missing existing control tool: $DEV_CONTROL"
+}
+
+main() {
+    load_local_environment
+    local command="${1:-help}"
+    shift || true
+    check_project_files
+    case "$command" in
+        build)
+            require_no_args build
+            configure_environment
+            run_dev_control build
+            ;;
+        flash|flash-diag)
+            (($# == 0)) || die "$command takes no arguments"
+            flash_command "$command"
+            ;;
+        monitor|diag)
+            require_no_args "$command"
+            prepare_hardware 0
+            run_dev_control "$command"
+            ;;
+        ui)
+            require_no_args ui
+            ui_command
+            ;;
+        status)
+            require_no_args status
+            status_command
+            ;;
+        clean)
+            clean_command "$@"
+            ;;
+        help|-h|--help)
+            require_no_args help
+            usage
+            ;;
+        *)
+            usage >&2
+            die "unknown command: $command"
+            ;;
+    esac
+}
+
+main "$@"

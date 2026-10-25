@@ -33,14 +33,14 @@ public:
     void showHome();
     void showRooms();
     void showRoom(size_t roomIndex);
-    void setContext(bool wifiConnected, const char *clockText);
+    void setContext(bool wifiConnected, const char *clockText, int batteryPercent);
     void bindMatterDevices(uint64_t nodeId, const std::vector<MatterDeviceItem> &devices);
     void bindPersistedDevices(uint64_t nodeId, const std::vector<MatterDeviceItem> &devices,
                               const UiConfig &config);
     bool updateDiscovery(const MatterDiscoveryResult &result);
     void beginOnboarding();
     bool onboardingActive() const { return onboarding_; }
-    void completeMatterCommand(const MatterUiResult &result);
+    bool completeMatterCommand(const MatterUiResult &result);
     bool handleTouch(const TouchEvent &event);
     bool render(bool forceFullRefresh);
 
@@ -48,9 +48,6 @@ private:
     enum class TouchZone : uint8_t {
         NONE,
         HOME_ALL_OFF,
-        HOME_ROOM_0,
-        HOME_ROOM_1,
-        HOME_ROOM_2,
         FOOTER_HOME,
         FOOTER_ROOMS,
         ROOMS_BACK,
@@ -62,12 +59,12 @@ private:
         ROOMS_ROOM_5,
         DETAIL_BACK,
         DETAIL_ALL_ON,
-        DETAIL_ALL_OFF,
         DETAIL_DEVICE_0,
         DETAIL_DEVICE_1,
         DETAIL_DEVICE_2,
         DETAIL_DEVICE_3,
         DETAIL_DEVICE_4,
+        DETAIL_DEVICE_5,
         HOME_SETTINGS,
         SETTINGS_BACK,
         SETTINGS_CONFIGURE,
@@ -103,6 +100,7 @@ private:
     };
 
     void renderHome();
+    void renderBattery();
     void renderRooms();
     void renderRoomDetail();
     void renderSettings();
@@ -116,7 +114,9 @@ private:
     TouchZone zoneAt(int x, int y) const;
     void activate(TouchZone zone);
     bool queueDevice(UiDevice &device, bool on, uint32_t batchId = 0);
+    void markDeviceDirty(const UiDevice &device);
     void queueRoom(UiRoom &room, bool on, uint32_t batchId);
+    void queueAllOff();
     void markScreen(ControlUiScreen screen);
     const char *screenName() const;
     const char *roomName(size_t roomIndex) const;
@@ -152,12 +152,15 @@ private:
     ControlUiScreen screen_ = ControlUiScreen::HOME;
     size_t selectedRoom_ = 0;
     bool dirty_ = true;
+    UiRect dirtyRegion_{};
     bool wifiConnected_ = false;
+    int batteryPercent_ = -1;
     char clockText_[8] = "--:--";
     TouchZone pressedZone_ = TouchZone::NONE;
     ControlUiScreen pressedScreen_ = ControlUiScreen::HOME;
     bool pressActive_ = false;
     bool pressMoved_ = false;
+    int64_t acceptTouchAfterUs_ = 0;
     uint32_t nextBatchId_ = 1;
     uint32_t activeBatchId_ = 0;
     size_t activeBatchExpected_ = 0;

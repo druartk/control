@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <array>
 #include <string>
 #include <vector>
 
@@ -51,6 +50,7 @@ struct MatterSavedNode {
 struct MatterDeviceItem {
     uint16_t endpoint_id = 0;
     std::string name;
+    std::string name_source;
     std::string type_label;
     bool has_onoff = false;
     bool has_level_control = false;
@@ -65,7 +65,7 @@ struct MatterDeviceItem {
     uint64_t last_seen_unix_or_boot_counter = 0;
 };
 
-constexpr size_t MATTER_DISCOVERY_MAX_ENDPOINTS = 48;
+constexpr size_t MATTER_DISCOVERY_SAFETY_LIMIT = 256;
 
 enum class MatterDiscoveryPhase : uint8_t {
     IDLE,
@@ -80,6 +80,7 @@ struct MatterDiscoveredDevice {
     uint64_t node_id = 0;
     uint16_t endpoint_id = 0;
     char display_name[48] = {};
+    char name_source[24] = {};
     bool has_onoff = false;
     bool has_level_control = false;
     bool reachable = false;
@@ -98,7 +99,9 @@ struct MatterDiscoveryResult {
     uint16_t endpoint_count = 0;
     uint16_t light_count = 0;
     bool truncated = false;
-    std::array<MatterDiscoveredDevice, MATTER_DISCOVERY_MAX_ENDPOINTS> devices{};
+    uint32_t scan_id = 0;
+    uint32_t duration_ms = 0;
+    std::vector<MatterDiscoveredDevice> devices;
 };
 
 enum class MatterSavedState {
@@ -144,6 +147,7 @@ enum class MatterUiAction : uint8_t {
     SetOn,
     SetOff,
     Toggle,
+    SetBrightness,
 };
 
 struct MatterUiCommand {
@@ -152,12 +156,18 @@ struct MatterUiCommand {
     MatterUiAction action = MatterUiAction::SetOff;
     uint32_t ui_device_id = 0;
     uint32_t batch_id = 0;
+    uint8_t brightness = 0;
 };
 
 struct MatterUiResult {
     MatterUiCommand command;
     bool success = false;
     esp_err_t error = ESP_FAIL;
+    bool state_known = false;
+    bool state = false;
+    bool level_known = false;
+    uint8_t level = 0;
+    uint32_t chip_error = 0;
 };
 
 esp_err_t matter_controller_init();
@@ -193,5 +203,8 @@ bool matter_controller_ui_poll_result(MatterUiResult &out);
 esp_err_t matter_controller_send_on(uint64_t node_id, uint16_t endpoint_id);
 esp_err_t matter_controller_send_off(uint64_t node_id, uint16_t endpoint_id);
 esp_err_t matter_controller_read_onoff(uint64_t node_id, uint16_t endpoint_id, bool &out_state);
+esp_err_t matter_controller_read_level(uint64_t node_id, uint16_t endpoint_id, uint8_t &out_level);
+esp_err_t matter_controller_ui_set_brightness(uint64_t node_id, uint16_t endpoint_id, uint8_t brightness,
+                                              uint32_t ui_device_id, uint32_t batch_id);
 const char *matter_commissioning_status_name(MatterCommissioningStatus status);
 const char *matter_post_commissioning_status_name(MatterPostCommissioningStatus status);

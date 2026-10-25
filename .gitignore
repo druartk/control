@@ -11,6 +11,7 @@ sdkconfig.matter
 
 # Temporary builds
 /tmp/
+build-*/
 *.bin
 *.elf
 *.map
@@ -32,6 +33,30 @@ sdkconfig
 sdkconfig.old
 
 # Logs and temporary files
+logs/
 *.log
+logs/*.pid
+logs/*.busid
 *.tmp
 *.bak
+tools/dev/control.local.env
+tools/dev/.tmp-*
+
+# Local credentials and dependency environments
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+venv/
+.venv/
+node_modules/
+
+# Local model weights
+*.safetensors
+*.gguf
+*.onnx
+*.ckpt

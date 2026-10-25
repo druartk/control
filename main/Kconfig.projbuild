@@ -132,6 +132,16 @@ config CONTROL_UI_MOCK_DEVICES
         Development-only dashboard fixtures. Matter stable builds keep this
         disabled so missing bindings never look like real devices.
 
+config CONTROL_WEB_SERIAL_CONFIGURATOR
+    bool "Enable the USB and authenticated Wi-Fi configurator"
+    depends on CONTROL_UI_MATTER_COMMANDS
+    default n
+    help
+        Enables the local @@CFG JSON protocol on the existing serial console.
+        Also serves the configurator over HTTP on the local Wi-Fi network,
+        protected by a per-device access code shown in Configuration.
+        It never exposes raw Matter or NVS access.
+
 config CONTROL_TOUCH_DEBUG
     bool "Verbose touch movement diagnostics"
     default y
@@ -148,10 +158,10 @@ config CONTROL_TOUCH_TASK_STACK_SIZE
 
 config CONTROL_ENABLE_PARTIAL_REFRESH
     bool "Enable experimental partial e-paper refresh"
-    default y
+    default n
     help
-        Enables the experimental region commit path. Full screen transitions
-        keep using the known-good full refresh sequence.
+        Disabled by default: the panel can retain ghost images or be damaged
+        by repeated partial refreshes. Full-screen refresh is the safe path.
 
 config CONTROL_PASSWORD_FIELD_PARTIAL_REFRESH
     bool "Use partial refresh for Wi-Fi password field"

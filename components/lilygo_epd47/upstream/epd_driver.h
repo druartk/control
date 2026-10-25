@@ -144,7 +144,8 @@ void epd_push_pixels(Rect_t area, int16_t time, int32_t color);
  *             over multiple rows, images of uneven width must add a padding
  *             nibble per line.
  */
-void IRAM_ATTR epd_draw_grayscale_image(Rect_t area, uint8_t *data);
+/** @return ESP_OK after drawing, ESP_ERR_NO_MEM if render resources cannot be allocated. */
+esp_err_t IRAM_ATTR epd_draw_grayscale_image(Rect_t area, uint8_t *data);
 
 /**
  * @brief Draw a picture to a given area, with some draw mode.
@@ -159,7 +160,8 @@ void IRAM_ATTR epd_draw_grayscale_image(Rect_t area, uint8_t *data);
  *             over multiple rows, images of uneven width must add a padding
  *             nibble per line.
  */
-void IRAM_ATTR epd_draw_image(Rect_t area, uint8_t *data, DrawMode_t mode);
+/** @return ESP_OK after drawing, ESP_ERR_NO_MEM if render resources cannot be allocated. */
+esp_err_t IRAM_ATTR epd_draw_image(Rect_t area, uint8_t *data, DrawMode_t mode);
 
 void IRAM_ATTR epd_draw_frame_1bit(Rect_t area, uint8_t *ptr, DrawMode_t mode, int32_t time);
 

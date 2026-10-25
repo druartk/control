@@ -30,8 +30,11 @@ public:
     const char *statusText() const { return status_.c_str(); }
 
     void beginFrame();
-    void title(const std::string &text);
+    void title(const std::string &text, int maxWidth = WIDTH - 56);
     void text(int x, int baseline, const std::string &text);
+    void textFitted(int x, int baseline, const std::string &text, int maxWidth);
+    int textWidth(const std::string &text) const;
+    std::string fitTextToWidth(const std::string &text, int maxWidth) const;
     void multiline(int x, int baseline, const std::string &text, int lineSpacing = 52);
     void button(const UiRect &rect, const std::string &label, bool inverted = false);
     void rectangle(const UiRect &rect, bool filled = false);

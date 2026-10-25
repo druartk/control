@@ -8,8 +8,11 @@ struct UiDevice {
     const char *name;
     bool is_on;
     uint8_t brightness;
+    bool brightness_known = false;
     bool state_known = false;
     bool matter_bound = false;
+    bool reachable_known = false;
+    bool reachable = false;
     uint64_t matter_node_id = 0;
     uint16_t matter_endpoint_id = 0;
     bool supports_onoff = false;
@@ -17,6 +20,8 @@ struct UiDevice {
     bool command_pending = false;
     bool command_failed = false;
     uint32_t pending_batch_id = 0;
+    bool pending_previous_state = false;
+    bool pending_previous_state_known = false;
 };
 
 struct UiRoom {

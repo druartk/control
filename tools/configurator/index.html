@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="fr">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Configurateur Matter</title><link rel="stylesheet" href="style.css"></head>
+<body>
+<!-- THESIS: make 167 Matter endpoints scannable and safely assignable; refuse the dashboard card wall. OWN-WORLD: a calm operations console with ink, paper, and one blue action color. STORY: cached discovery is visible, configuration state is explicit, and every assignment is reversible before save. FIRST VIEWPORT: configuration rail left, device workspace right, search and filters above the list, scan state visible in place. FORM: operate console, existing surface extended. FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, and DESIGN.md -->
+<header class="topbar"><div class="brand"><h1>Configurateur Matter</h1><p>Organiser les appareils du pont</p></div><span id="connection" class="badge off">Déconnecté</span><label id="wifi-credentials" hidden>Code Wi-Fi <input id="access-code" type="password" maxlength="16" autocomplete="off" spellcheck="false" aria-label="Code d’accès Wi-Fi de l’ESP32"></label><button id="connect" class="primary">Connecter l’ESP32</button></header>
+<main>
+  <aside class="rail">
+    <section><div class="section-heading"><h2>Configuration</h2><span id="dirty-indicator" class="dirty" hidden>non enregistrée</span></div><div id="configs"></div><button id="new-config" class="wide">+ Nouvelle configuration</button></section>
+    <section><div class="section-heading"><h2>Pièces</h2></div><div id="rooms"></div><button id="new-room" class="wide">+ Ajouter une pièce</button></section>
+    <section class="small"><button id="import">Importer JSON</button><button id="export">Exporter JSON</button><input id="file" type="file" accept="application/json" hidden></section>
+  </aside>
+  <section class="content">
+    <p id="wifi-info" class="status" hidden></p>
+    <div class="workspace-heading"><div><p class="overline">Appareils Matter</p><h2>Choisissez où ils vivent.</h2><p><span id="device-count">0 appareils connus</span><span class="dot">·</span><span id="result-count">0 affichés</span></p></div><strong id="active-config" class="active-config">Aucune configuration active</strong></div>
+    <div class="toolbar"><button id="refresh" title="Relire le cache connu, environ 0,5 seconde">Actualiser le cache</button><button id="rescan" title="Découverte Matter complète, généralement 30 à 45 secondes">Rescanner Matter</button><button id="reload">Recharger configuration</button><button id="save" class="primary">Enregistrer sur l’ESP32</button><button id="reset" class="danger">Effacer la configuration UI</button><span class="toolbar-help">Actualiser = cache rapide · Rescanner Matter = découverte complète</span></div>
+    <div id="scan-state" class="scan-state" hidden role="status" aria-live="polite"></div>
+    <div class="filters" role="search"><label class="search-field"><span>Rechercher</span><input id="search" type="search" placeholder="Nom, endpoint ou pièce…" autocomplete="off"></label><label><span>État</span><select id="status-filter"><option value="all">Tous</option><option value="assigned">Affectés</option><option value="unassigned">Non affectés</option><option value="reachable">Disponibles</option><option value="unreachable">Indisponibles</option><option value="unknown">Inconnus</option></select></label><label><span>Pièce</span><select id="room-filter"><option value="all">Toutes les pièces</option></select></label><label><span>Vue</span><select id="view-filter"><option value="normal">Appareils pilotables</option><option value="all">Tous les endpoints Matter</option></select></label><label><span>Trier par</span><select id="sort"><option value="name">Nom (A → Z)</option><option value="endpoint">Endpoint</option><option value="room">Pièce</option><option value="reachability">Disponibilité</option><option value="controllable">Pilotabilité</option></select></label></div>
+    <div id="selection-bar" class="selection-bar" hidden><strong id="selection-count">0 appareil sélectionné</strong><button id="select-visible">Sélectionner les visibles</button><select id="bulk-room"><option value="">Choisir une pièce…</option></select><button id="assign-selected" class="primary">Affecter</button><button id="clear-selected">Retirer l’affectation</button></div>
+    <div id="status" class="status">Connectez l’ESP32 pour commencer.</div>
+    <div id="devices" class="devices"></div>
+  </section>
+</main>
+<script type="module" src="app.js"></script>
+</body></html>
