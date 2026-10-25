@@ -347,9 +347,9 @@ Classification :
 - les changements d'écran et actions de clavier utilisent encore un plein
   rafraîchissement. L'abstraction est prête pour une politique de zones
   partielles, mais celle-ci doit être caractérisée sur la dalle réelle pour
-  limiter ghosting et usure. Le profil Matter stable garde les rafraîchissements
-  complets pour toutes les actions tant que les zones partielles ne sont pas
-  validées sur la dalle réelle ;
+  limiter ghosting et usure. Le profil Matter stable active les zones partielles
+  pour les statuts et boutons de lumières, avec un repli sur un dessin complet
+  en cas d'erreur. La navigation et le clavier gardent un dessin complet ;
 - les réseaux masqués sont indiqués clairement mais la saisie manuelle de leur
   SSID est reportée ;
 - les identifiants NVS ne sont pas encore chiffrés par flash encryption ;

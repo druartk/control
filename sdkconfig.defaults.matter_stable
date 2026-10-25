@@ -30,8 +30,8 @@ CONFIG_CONTROL_WEB_SERIAL_CONFIGURATOR=y
 # Leave room for normal browser headers on the Wi-Fi configurator.
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 
-# Use full refreshes until partial refreshes are validated on the physical panel.
-# CONFIG_CONTROL_ENABLE_PARTIAL_REFRESH is not set
+# Refresh status and light buttons by region; keep navigation and password screens full.
+CONFIG_CONTROL_ENABLE_PARTIAL_REFRESH=y
 CONFIG_CONTROL_PASSWORD_FIELD_PARTIAL_REFRESH=n
 CONFIG_CONTROL_PASSWORD_KEYBOARD_PARTIAL_REFRESH=n
 
