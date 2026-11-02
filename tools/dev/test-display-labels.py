@@ -80,6 +80,17 @@ struct ControlUi {
 ''' + battery + home + r'''
 int main() {
     DisplayManager display;
+    for(const char* label : {"Précédent", "Suivant"}) {
+        draws.clear(); display.button({32,460,270,48},label);
+        assert(draws.size()==1 && draws[0].label==label);
+        assert(draws[0].x>=32 && draws[0].x+display.textWidth(draws[0].label)<=302);
+    }
+    assert(display.textWidth("Page 6 / 6")<=260);
+    for(const std::string glyph : {"é", "€", "💡"}) {
+        const std::string expected=glyph+glyph+"...";
+        const auto fitted=display.fitTextToWidth(glyph+glyph+glyph+glyph,display.textWidth(expected));
+        assert(fitted==expected && "truncate only at complete UTF-8 character boundaries");
+    }
     for (bool inverted : {false, true}) {
         draws.clear();
         display.button({32, 175, 285, 126}, "Plafond Bureau", inverted);

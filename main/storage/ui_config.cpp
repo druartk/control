@@ -4,6 +4,8 @@
 #include <cstring>
 
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "nvs.h"
 
 namespace {
@@ -12,6 +14,19 @@ constexpr const char *NAMESPACE = "control_ui";
 constexpr const char *KEY = "config";
 constexpr uint32_t MAGIC = 0x43554931; // CUI1
 constexpr uint32_t COLLECTION_MAGIC = 0x43554331; // CUC1
+
+// Readers and the configurator share scratch buffers and multi-key NVS writes.
+class ConfigLock {
+public:
+    ConfigLock() { xSemaphoreTakeRecursive(mutex(), portMAX_DELAY); }
+    ~ConfigLock() { xSemaphoreGiveRecursive(mutex()); }
+private:
+    static SemaphoreHandle_t mutex() {
+        static StaticSemaphore_t storage;
+        static SemaphoreHandle_t handle = xSemaphoreCreateRecursiveMutexStatic(&storage);
+        return handle;
+    }
+};
 
 #pragma pack(push, 1)
 struct StoredConfig {
@@ -92,6 +107,20 @@ bool validUiConfig(const UiConfig &config) {
     return true;
 }
 
+bool validCollection(const UiConfigCollection &configs) {
+    if (configs.schema_version != CONTROL_UI_CONFIG_SCHEMA_VERSION ||
+        configs.config_count == 0 || configs.config_count > CONTROL_UI_CONFIG_MAX_CONFIGS ||
+        configs.active_config_id == 0) return false;
+    bool activeFound = false;
+    for (size_t i = 0; i < configs.config_count; ++i) {
+        const UiNamedConfig &config = configs.configs[i];
+        if (config.config_id == 0 || !validText(config.name, sizeof(config.name)) || !validUiConfig(config.ui)) return false;
+        activeFound |= config.config_id == configs.active_config_id;
+        for (size_t j = 0; j < i; ++j) if (config.config_id == configs.configs[j].config_id) return false;
+    }
+    return activeFound;
+}
+
 void packConfig(const UiConfig &config, StoredConfig &stored) {
     stored = {};
     stored.magic = MAGIC;
@@ -145,9 +174,17 @@ bool unpackMeta(const CollectionMeta &meta) {
            meta.config_count > 0 && meta.config_count <= CONTROL_UI_CONFIG_MAX_CONFIGS && meta.active_config_id != 0 &&
            meta.crc32 == crc32(reinterpret_cast<const uint8_t *>(&meta), offsetof(CollectionMeta, crc32));
 }
+
+esp_err_t readMeta(nvs_handle_t handle, CollectionMeta &meta) {
+    size_t size = sizeof(meta);
+    const esp_err_t err = nvs_get_blob(handle, "cfgmeta", &meta, &size);
+    if (err != ESP_OK) return err;
+    return size == sizeof(meta) && unpackMeta(meta) ? ESP_OK : ESP_ERR_INVALID_CRC;
+}
 }
 
 esp_err_t control_ui_config_load(UiConfig &out) {
+    ConfigLock lock;
     out = UiConfig{};
     nvs_handle_t handle = 0;
     esp_err_t err = nvs_open(NAMESPACE, NVS_READONLY, &handle);
@@ -155,8 +192,8 @@ esp_err_t control_ui_config_load(UiConfig &out) {
     if (err != ESP_OK) return err;
 
     static CollectionMeta meta{};
-    size_t metaSize = sizeof(meta);
-    if (nvs_get_blob(handle, "cfgmeta", &meta, &metaSize) == ESP_OK && metaSize == sizeof(meta) && unpackMeta(meta)) {
+    err = readMeta(handle, meta);
+    if (err == ESP_OK) {
         for (size_t i = 0; i < meta.config_count; ++i) {
             char key[8];
             snprintf(key, sizeof(key), "cfg%u", static_cast<unsigned>(i));
@@ -170,6 +207,12 @@ esp_err_t control_ui_config_load(UiConfig &out) {
                 return ESP_OK;
             }
         }
+        nvs_close(handle);
+        return ESP_ERR_INVALID_CRC;
+    }
+    if (err != ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(handle);
+        return err;
     }
 
     size_t size = 0;
@@ -181,17 +224,18 @@ esp_err_t control_ui_config_load(UiConfig &out) {
             nvs_close(handle);
             return ESP_OK;
         }
-        err = ESP_ERR_INVALID_VERSION;
+        if (err == ESP_OK) err = ESP_ERR_INVALID_VERSION;
     } else if (err == ESP_OK) {
         err = ESP_ERR_INVALID_SIZE;
     }
     nvs_close(handle);
-    ESP_LOGW(TAG, "invalid_config result=%s clearing_namespace=yes", esp_err_to_name(err));
-    const esp_err_t clear_err = clearNamespace();
-    return clear_err == ESP_OK ? err : clear_err;
+    if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_ERR_NOT_FOUND;
+    ESP_LOGW(TAG, "config_load_failed result=%s", esp_err_to_name(err));
+    return err;
 }
 
 esp_err_t control_ui_config_save(const UiConfig &config) {
+    ConfigLock lock;
     if (!validUiConfig(config)) return ESP_ERR_INVALID_ARG;
     StoredConfig stored{};
     packConfig(config, stored);
@@ -207,12 +251,14 @@ esp_err_t control_ui_config_save(const UiConfig &config) {
 }
 
 esp_err_t control_ui_config_clear() {
+    ConfigLock lock;
     const esp_err_t err = clearNamespace();
     ESP_LOGI(TAG, "clear result=%s namespace=%s", esp_err_to_name(err), NAMESPACE);
     return err;
 }
 
 esp_err_t control_ui_config_collection_load(UiConfigCollection &out) {
+    ConfigLock lock;
     std::memset(&out, 0, sizeof(out));
     out.schema_version = CONTROL_UI_CONFIG_SCHEMA_VERSION;
     nvs_handle_t handle = 0;
@@ -220,12 +266,13 @@ esp_err_t control_ui_config_collection_load(UiConfigCollection &out) {
     if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_ERR_NOT_FOUND;
     if (err != ESP_OK) return err;
     static CollectionMeta meta{};
-    size_t metaSize = sizeof(meta);
-    err = nvs_get_blob(handle, "cfgmeta", &meta, &metaSize);
-    if (err != ESP_OK || metaSize != sizeof(meta) || !unpackMeta(meta)) {
+    err = readMeta(handle, meta);
+    if (err != ESP_OK) {
         nvs_close(handle);
+        if (err != ESP_ERR_NVS_NOT_FOUND) return err;
         static UiConfig legacy;
-        if (control_ui_config_load(legacy) != ESP_OK) return ESP_ERR_NOT_FOUND;
+        err = control_ui_config_load(legacy);
+        if (err != ESP_OK) return err;
         out.config_count = 1;
         out.active_config_id = 1;
         out.configs[0].config_id = 1;
@@ -250,26 +297,21 @@ esp_err_t control_ui_config_collection_load(UiConfigCollection &out) {
         }
     }
     nvs_close(handle);
+    if (!validCollection(out)) {
+        out = UiConfigCollection{};
+        return ESP_ERR_INVALID_CRC;
+    }
     return ESP_OK;
 }
 
 esp_err_t control_ui_config_collection_save(const UiConfigCollection &configs) {
-    if (configs.schema_version != CONTROL_UI_CONFIG_SCHEMA_VERSION ||
-        configs.config_count == 0 || configs.config_count > CONTROL_UI_CONFIG_MAX_CONFIGS ||
-        configs.active_config_id == 0) return ESP_ERR_INVALID_ARG;
+    ConfigLock lock;
+    if (!validCollection(configs)) return ESP_ERR_INVALID_ARG;
     CollectionMeta meta{};
     meta.magic = COLLECTION_MAGIC;
     meta.schema_version = configs.schema_version;
     meta.config_count = configs.config_count;
     meta.active_config_id = configs.active_config_id;
-    bool activeFound = false;
-    for (size_t i = 0; i < configs.config_count; ++i) {
-        if (configs.configs[i].config_id == 0 || !validText(configs.configs[i].name, sizeof(configs.configs[i].name)) ||
-            !validUiConfig(configs.configs[i].ui)) return ESP_ERR_INVALID_ARG;
-        if (configs.configs[i].config_id == configs.active_config_id) activeFound = true;
-        for (size_t j = 0; j < i; ++j) if (configs.configs[i].config_id == configs.configs[j].config_id) return ESP_ERR_INVALID_ARG;
-    }
-    if (!activeFound) return ESP_ERR_INVALID_ARG;
     meta.crc32 = crc32(reinterpret_cast<const uint8_t *>(&meta), offsetof(CollectionMeta, crc32));
 
     nvs_handle_t handle = 0;

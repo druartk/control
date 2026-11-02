@@ -119,6 +119,11 @@ int main() {
     assert(taskCalls==30 && taskDeleted==30 && waits==30 && semDeleted==2 && resets==0);
     assert(delayTicks==10+15*5 && "keep factory settling and inter-pass timing");
     DisplayManager display;
+    for (auto& pixel : display.pixels) pixel=0xFF;
+    resetMocks();
+    assert(!display.commitFull("empty") && display.firstRender_ && !display.busy());
+    assert(power==0 && taskCalls==0 && "empty frames must preserve the panel");
+    display.pixels[0]=0;
     resetMocks(); taskFailure=2;
     assert(!display.commitFull("failed"));
     assert(display.firstRender_ && !display.busy() && power==0);

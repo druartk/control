@@ -11,6 +11,7 @@ header = (root / "main/ui/control_ui.h").read_text()
 display = (root / "main/display/display_manager.cpp").read_text()
 screen_enum = re.search(r"enum class ControlUiScreen \{.*?\};", header, re.S)[0]
 tiles = re.search(r"constexpr UiRect DETAIL_DEVICE_TILES\[\] = \{.*?\};", ui, re.S)[0]
+tiles += re.search(r"constexpr size_t DETAIL_DEVICE_PAGE_SIZE = [^;]+;", ui)[0]
 layout = "\n".join(re.search(rf"constexpr int {name} = [^;]+;", ui)[0] for name in (
     "SCREEN_MARGIN", "CONTENT_WIDTH", "ROOM_TILES_TOP",
     "ROOM_TILE_HEIGHT", "ROOM_TILE_GAP", "ROOM_TILE_COLUMN_GAP"))
@@ -76,7 +77,7 @@ struct UiDevice {};
 struct UiRoom { UiDevice* devices; size_t device_count; };
 struct ControlUi {
     DisplayManager& display_;
-    UiRoom* rooms_; size_t selectedRoom_=0, roomCount_=1;
+    UiRoom* rooms_; size_t selectedRoom_=0, roomCount_=1, roomDevicePage_=0;
     ControlUiScreen screen_ = ControlUiScreen::ROOM_DETAIL;
     bool dirty_=true; UiRect dirtyRegion_{};
     int64_t acceptTouchAfterUs_=0;

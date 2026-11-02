@@ -65,6 +65,8 @@ private:
         DETAIL_DEVICE_3,
         DETAIL_DEVICE_4,
         DETAIL_DEVICE_5,
+        DETAIL_PREVIOUS,
+        DETAIL_NEXT,
         HOME_SETTINGS,
         SETTINGS_BACK,
         SETTINGS_CONFIGURE,
@@ -151,6 +153,7 @@ private:
     char pendingCustomName_[48] = {};
     ControlUiScreen screen_ = ControlUiScreen::HOME;
     size_t selectedRoom_ = 0;
+    size_t roomDevicePage_ = 0;
     bool dirty_ = true;
     UiRect dirtyRegion_{};
     bool wifiConnected_ = false;

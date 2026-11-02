@@ -100,7 +100,7 @@ int matter_controller_ui_enqueue(const MatterUiCommand& command) {
 ''' + screens + r'''
 struct ControlUi {
     UiRoom* rooms_; size_t roomCount_=1;
-    size_t selectedRoom_=0;
+    size_t selectedRoom_=0, roomDevicePage_=0;
     ControlUiScreen screen_=ControlUiScreen::HOME;
     void showRoom(size_t);
     void markScreen(ControlUiScreen screen) { screen_=screen; dirty_=true; }

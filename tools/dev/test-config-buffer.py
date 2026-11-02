@@ -12,6 +12,8 @@ initialize = serial[serial.index("    g_configs = static_cast<UiConfigCollection
 header = (root / "main/storage/ui_config.h").read_text()
 types = header[header.index("constexpr uint16_t"):header.index("esp_err_t control_ui_config_load")]
 configs = serial[serial.index("bool ensureConfigs("):serial.index("bool getDevices(")]
+import_guard = serial[serial.index('        const cJSON *configObject = field(root, "config");'):
+                      serial.index('        parsed.revision = target->revision + 1;')]
 source = r'''
 #include <cassert>
 #include <cstring>
@@ -22,6 +24,7 @@ source = r'''
 #define ESP_LOGI(...) ((void)0)
 using esp_err_t=int;
 constexpr int ESP_OK=0, ESP_FAIL=-1, ESP_ERR_NO_MEM=1;
+constexpr int ESP_ERR_NOT_FOUND=2;
 constexpr int MALLOC_CAP_SPIRAM=1, MALLOC_CAP_8BIT=2;
 constexpr size_t MAX_FRAME=8192;
 ''' + types + r'''
@@ -60,13 +63,26 @@ int initialize() {
 ''' + initialize + r'''
     return ESP_OK;
 }
-bool failLoad=false;
+int loadResult=ESP_OK;
 int control_ui_config_collection_load(UiConfigCollection& out) {
-    if(failLoad) return ESP_FAIL;
+    if(loadResult!=ESP_OK) return loadResult;
     out.config_count=1; out.active_config_id=7; out.configs[0].config_id=7;
     return ESP_OK;
 }
 ''' + configs + r'''
+struct cJSON {};
+const cJSON* field(cJSON*,const char*) { return nullptr; }
+bool parseOk=false;
+bool parseConfig(const cJSON*,UiNamedConfig& out) { out.config_id=9; return parseOk; }
+bool validateEndpoints(const UiNamedConfig&,bool) { return true; }
+int importErrors=0;
+void sendError(int,const char*,const char*) { ++importErrors; }
+void cJSON_Delete(cJSON*) {}
+#define ESP_LOGW(...) ((void)0)
+void checkImport(const char* cmd) {
+    cJSON* root=nullptr; int id=1;
+''' + import_guard + r'''
+}
 int main() {
     assert(initialize()==ESP_OK);
     assert(g_configs!=g_verified_configs && g_configs->schema_version==1 && g_verified_configs->schema_version==1);
@@ -74,9 +90,16 @@ int main() {
         assert(memory[2][i]==(i>=8 && i<MAX_FRAME+8 ? 0 : 0xa5));
     assert(ensureConfigs() && activeConfig()==&g_configs->configs[0]);
     assert(configById(7) && !configById(8));
-    g_configs_loaded=false; failLoad=true;
+    g_configs_loaded=false; loadResult=ESP_FAIL;
+    assert(!ensureConfigs() && !g_configs_loaded && !activeConfig());
+    loadResult=ESP_ERR_NOT_FOUND;
     assert(ensureConfigs() && activeConfig()->config_id==1);
     assert(!strcmp(activeConfig()->name,"Maison"));
+    checkImport("import_config");
+    assert(importErrors==1 && g_configs->config_count==1 && !configById(9));
+    parseOk=true;
+    checkImport("import_config");
+    assert(importErrors==1 && g_configs->config_count==2 && configById(9));
     assert(g_verified_configs->config_count==0);
     g_line[MAX_FRAME-1]='x';
     g_requests=(void*)1; g_responses=(void*)2;

@@ -5,6 +5,7 @@
 #if CONFIG_CONTROL_WEB_SERIAL_CONFIGURATOR
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -88,8 +89,8 @@ PendingRequest g_pending[MAX_PENDING]{};
 UiConfigCollection *g_configs = nullptr;
 UiConfigCollection *g_verified_configs = nullptr;
 bool g_configs_loaded = false;
-volatile bool g_config_update = false;
-volatile uint32_t g_config_update_id = 0;
+std::atomic<bool> g_config_update{false};
+std::atomic<uint32_t> g_config_update_id{0};
 char *g_line = nullptr;
 size_t g_line_length = 0;
 bool g_line_discard = false;
@@ -340,6 +341,7 @@ void releasePending(PendingRequest &pending) {
 bool ensureConfigs() {
     if (g_configs_loaded) return true;
     const esp_err_t loadErr = control_ui_config_collection_load(*g_configs);
+    if (loadErr != ESP_OK && loadErr != ESP_ERR_NOT_FOUND) return false;
     if (loadErr != ESP_OK) {
         *g_configs = UiConfigCollection{};
         g_configs->config_count = 1;
@@ -353,7 +355,7 @@ bool ensureConfigs() {
 }
 
 UiNamedConfig *configById(uint32_t id) {
-    ensureConfigs();
+    if (!ensureConfigs()) return nullptr;
     for (size_t i = 0; i < g_configs->config_count; ++i) if (g_configs->configs[i].config_id == id) return &g_configs->configs[i];
     return nullptr;
 }
@@ -744,7 +746,17 @@ void handleRequest(const ConfigRequest &request) {
         cJSON_Delete(root);
         return;
     }
-    ensureConfigs();
+    if (!strcmp(cmd, "reset_ui_config")) {
+        const cJSON *confirm = field(root, "confirm");
+        if (!cJSON_IsString(confirm) || strcmp(confirm->valuestring, "RESET_UI_ONLY")) sendError(id, "CONFIRM_REQUIRED", "Confirmation requise");
+        else { const esp_err_t err = control_ui_config_clear(); if (err != ESP_OK) sendError(id, "RESET_FAILED", esp_err_to_name(err)); else { g_configs_loaded = false; g_config_update_id = 0; g_config_update = true; cJSON *response = cJSON_CreateObject(); cJSON_AddStringToObject(response, "type", "ui_config_reset"); cJSON_AddStringToObject(response, "preserved", "Matter fabric, DIRIGERA node, Wi-Fi, device cache, display and touch"); respond(response, id); } }
+        cJSON_Delete(root); return;
+    }
+    if (!ensureConfigs()) {
+        sendError(id, "CONFIG_LOAD_FAILED", "Lecture de la configuration impossible; données conservées");
+        cJSON_Delete(root);
+        return;
+    }
     if (!strcmp(cmd, "get_rooms")) {
         cJSON *response = cJSON_CreateObject(); cJSON_AddStringToObject(response, "type", "rooms");
         const UiNamedConfig *config = activeConfig(); cJSON_AddNumberToObject(response, "config_id", config ? config->config_id : 0);
@@ -805,8 +817,9 @@ void handleRequest(const ConfigRequest &request) {
     if (!strcmp(cmd, "save_config") || !strcmp(cmd, "update_config") || !strcmp(cmd, "import_config")) {
         const cJSON *configObject = field(root, "config");
         UiNamedConfig parsed{};
-        UiNamedConfig *target = parseConfig(configObject, parsed) ? configById(parsed.config_id) : nullptr;
-        const bool canImport = !strcmp(cmd, "import_config") && g_configs->config_count < CONTROL_UI_CONFIG_MAX_CONFIGS;
+        const bool parsedOk = parseConfig(configObject, parsed);
+        UiNamedConfig *target = parsedOk ? configById(parsed.config_id) : nullptr;
+        const bool canImport = parsedOk && !strcmp(cmd, "import_config") && g_configs->config_count < CONTROL_UI_CONFIG_MAX_CONFIGS;
         if ((!target && !canImport) || !validateEndpoints(parsed, true)) {
             ESP_LOGW(TAG, "config_validate id=%lu result=invalid", static_cast<unsigned long>(parsed.config_id));
             sendError(id, "INVALID_CONFIG", "Configuration invalide ou endpoint inconnu");
@@ -834,12 +847,13 @@ void handleRequest(const ConfigRequest &request) {
         cJSON_Delete(root); return;
     }
     if (!strcmp(cmd, "reload_config")) {
-        g_configs_loaded = false; ensureConfigs(); cJSON *response = cJSON_CreateObject(); cJSON_AddStringToObject(response, "type", "config_reloaded"); cJSON_AddNumberToObject(response, "config_id", g_configs->active_config_id); respond(response, id); g_config_update_id = g_configs->active_config_id; g_config_update = true; cJSON_Delete(root); return;
-    }
-    if (!strcmp(cmd, "reset_ui_config")) {
-        const cJSON *confirm = field(root, "confirm");
-        if (!cJSON_IsString(confirm) || strcmp(confirm->valuestring, "RESET_UI_ONLY")) sendError(id, "CONFIRM_REQUIRED", "Confirmation requise");
-        else { const esp_err_t err = control_ui_config_clear(); if (err != ESP_OK) sendError(id, "RESET_FAILED", esp_err_to_name(err)); else { g_configs_loaded = false; g_config_update_id = 0; g_config_update = true; cJSON *response = cJSON_CreateObject(); cJSON_AddStringToObject(response, "type", "ui_config_reset"); cJSON_AddStringToObject(response, "preserved", "Matter fabric, DIRIGERA node, Wi-Fi, device cache, display and touch"); respond(response, id); } }
+        g_configs_loaded = false;
+        if (!ensureConfigs()) {
+            sendError(id, "CONFIG_LOAD_FAILED", "Lecture de la configuration impossible; données conservées");
+            cJSON_Delete(root);
+            return;
+        }
+        cJSON *response = cJSON_CreateObject(); cJSON_AddStringToObject(response, "type", "config_reloaded"); cJSON_AddNumberToObject(response, "config_id", g_configs->active_config_id); respond(response, id); g_config_update_id = g_configs->active_config_id; g_config_update = true;
         cJSON_Delete(root); return;
     }
     if (!strcmp(cmd, "rescan_devices")) {
@@ -1096,15 +1110,11 @@ void control_config_serial_handle_matter_result(const MatterUiResult &result) {
 }
 
 bool control_config_serial_take_config_update() {
-    const bool changed = g_config_update;
-    g_config_update = false;
-    return changed;
+    return g_config_update.exchange(false);
 }
 
 uint32_t control_config_serial_take_active_config_id() {
-    const uint32_t id = g_config_update_id;
-    g_config_update_id = 0;
-    return id;
+    return g_config_update_id.load();
 }
 
 #else

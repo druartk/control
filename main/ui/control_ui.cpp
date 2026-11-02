@@ -36,6 +36,9 @@ constexpr int ROOM_TILE_GAP = 18;
 constexpr int ROOM_TILE_COLUMN_GAP = 16;
 constexpr UiRect DETAIL_BACK{32, 90, 190, 58};
 constexpr UiRect DETAIL_ALL_ON{245, 90, 320, 58};
+constexpr size_t DETAIL_DEVICE_PAGE_SIZE = 6;
+constexpr UiRect DETAIL_PREVIOUS{32, 460, 270, 48};
+constexpr UiRect DETAIL_NEXT{658, 460, 270, 48};
 constexpr UiRect DETAIL_DEVICE_TILES[] = {
     {32, 175, 285, 126}, {337, 175, 285, 126}, {642, 175, 286, 126},
     {32, 319, 285, 126}, {337, 319, 285, 126}, {642, 319, 286, 126},
@@ -136,6 +139,7 @@ void ControlUi::init() {
 #endif
     screen_ = ControlUiScreen::HOME;
     selectedRoom_ = 0;
+    roomDevicePage_ = 0;
     selectedDevice_ = 0;
     pressedZone_ = TouchZone::NONE;
     pressActive_ = false;
@@ -170,10 +174,22 @@ void ControlUi::bindMatterDevices(uint64_t nodeId, const std::vector<MatterDevic
 
 void ControlUi::bindPersistedDevices(uint64_t nodeId, const std::vector<MatterDeviceItem> &devices,
                                      const UiConfig &config) {
+    const uint32_t selectedRoomId = rooms_ && selectedRoom_ < roomCount_ ? rooms_[selectedRoom_].id : 0;
     nodeId_ = nodeId;
     config_ = config;
     hasConfig_ = config.binding_count != 0;
     rebuildFromConfig(nodeId, devices, config);
+    if (screen_ == ControlUiScreen::ROOM_DETAIL) {
+        size_t index = 0;
+        while (index < roomCount_ && rooms_[index].id != selectedRoomId) ++index;
+        if (index < roomCount_) {
+            selectedRoom_ = index;
+            const size_t count = rooms_[index].device_count;
+            roomDevicePage_ = std::min(roomDevicePage_, count ? (count - 1) / DETAIL_DEVICE_PAGE_SIZE : size_t{0});
+        } else { selectedRoom_ = 0; roomDevicePage_ = 0; markScreen(ControlUiScreen::ROOMS); }
+    }
+    pressActive_ = false;
+    pressedZone_ = TouchZone::NONE;
     dirty_ = true;
 }
 
@@ -337,6 +353,7 @@ void ControlUi::showRoom(size_t roomIndex) {
         return;
     }
     selectedRoom_ = roomIndex;
+    roomDevicePage_ = 0;
     markScreen(ControlUiScreen::ROOM_DETAIL);
     ESP_LOGI(TAG, "screen=room_detail room=%s", roomName(selectedRoom_));
 }
@@ -438,10 +455,17 @@ void ControlUi::renderRoomDetail() {
     if (!rooms_ || selectedRoom_ >= roomCount_) return;
     const UiRoom &room = rooms_[selectedRoom_]; display_.title(std::string("< ") + room.name, 240);
     display_.button(DETAIL_BACK, "Retour"); display_.button(DETAIL_ALL_ON, "Tout allumer");
-    for (size_t i = 0; i < room.device_count && i < 6; ++i) {
-        const UiDevice &device = room.devices[i];
+    const size_t first = roomDevicePage_ * DETAIL_DEVICE_PAGE_SIZE;
+    for (size_t i = 0; i < DETAIL_DEVICE_PAGE_SIZE && first + i < room.device_count; ++i) {
+        const UiDevice &device = room.devices[first + i];
         display_.button(DETAIL_DEVICE_TILES[i], device.command_pending ? "En cours..." : device.name,
                         device.state_known && device.is_on);
+    }
+    if (room.device_count > DETAIL_DEVICE_PAGE_SIZE) {
+        if (roomDevicePage_ > 0) display_.button(DETAIL_PREVIOUS, "Précédent");
+        const size_t pages = (room.device_count + DETAIL_DEVICE_PAGE_SIZE - 1) / DETAIL_DEVICE_PAGE_SIZE;
+        display_.textFitted(350, 495, std::string("Page ") + std::to_string(roomDevicePage_ + 1) + " / " + std::to_string(pages), 260);
+        if (first + DETAIL_DEVICE_PAGE_SIZE < room.device_count) display_.button(DETAIL_NEXT, "Suivant");
     }
 }
 
@@ -523,11 +547,13 @@ void ControlUi::markDeviceDirty(const UiDevice &device) {
     UiRect tile{};
     if (screen_ == ControlUiScreen::ROOM_DETAIL && rooms_ && selectedRoom_ < roomCount_) {
         const UiRoom &room = rooms_[selectedRoom_];
-        for (size_t i = 0; i < room.device_count && i < 6; ++i) {
-            if (&room.devices[i] != &device) continue;
+        const size_t first = roomDevicePage_ * DETAIL_DEVICE_PAGE_SIZE;
+        for (size_t i = 0; i < DETAIL_DEVICE_PAGE_SIZE && first + i < room.device_count; ++i) {
+            if (&room.devices[first + i] != &device) continue;
             tile = DETAIL_DEVICE_TILES[i];
             break;
         }
+        if (tile.width == 0) return;
     } else if (rooms_ && screen_ == ControlUiScreen::ROOMS) {
         const size_t count = std::min(roomCount_, size_t{6});
         for (size_t r = 0; r < count; ++r) {
@@ -702,7 +728,11 @@ ControlUi::TouchZone ControlUi::zoneAt(int x, int y) const {
             if (DETAIL_BACK.contains(x, y)) return TouchZone::DETAIL_BACK;
             if (DETAIL_ALL_ON.contains(x, y)) return TouchZone::DETAIL_ALL_ON;
             if (rooms_ && selectedRoom_ < roomCount_) {
-                for (size_t i = 0; i < rooms_[selectedRoom_].device_count && i < 6; ++i) {
+                const size_t count = rooms_[selectedRoom_].device_count;
+                const size_t first = roomDevicePage_ * DETAIL_DEVICE_PAGE_SIZE;
+                if (roomDevicePage_ > 0 && DETAIL_PREVIOUS.contains(x, y)) return TouchZone::DETAIL_PREVIOUS;
+                if (first + DETAIL_DEVICE_PAGE_SIZE < count && DETAIL_NEXT.contains(x, y)) return TouchZone::DETAIL_NEXT;
+                for (size_t i = 0; i < DETAIL_DEVICE_PAGE_SIZE && first + i < count; ++i) {
                     if (DETAIL_DEVICE_TILES[i].contains(x, y)) return static_cast<TouchZone>(static_cast<uint8_t>(TouchZone::DETAIL_DEVICE_0) + i);
                 }
             }
@@ -795,7 +825,28 @@ void ControlUi::activate(TouchZone zone) {
         case TouchZone::ROOMS_ROOM_0: case TouchZone::ROOMS_ROOM_1: case TouchZone::ROOMS_ROOM_2: case TouchZone::ROOMS_ROOM_3: case TouchZone::ROOMS_ROOM_4: case TouchZone::ROOMS_ROOM_5: showRoom(static_cast<size_t>(static_cast<uint8_t>(zone) - static_cast<uint8_t>(TouchZone::ROOMS_ROOM_0))); break;
         case TouchZone::DETAIL_BACK: showRooms(); break;
         case TouchZone::DETAIL_ALL_ON: if (rooms_ && selectedRoom_ < roomCount_) queueRoom(rooms_[selectedRoom_], true, nextBatchId_++); break;
-        case TouchZone::DETAIL_DEVICE_0: case TouchZone::DETAIL_DEVICE_1: case TouchZone::DETAIL_DEVICE_2: case TouchZone::DETAIL_DEVICE_3: case TouchZone::DETAIL_DEVICE_4: case TouchZone::DETAIL_DEVICE_5: { size_t i = static_cast<size_t>(static_cast<uint8_t>(zone) - static_cast<uint8_t>(TouchZone::DETAIL_DEVICE_0)); if (rooms_ && selectedRoom_ < roomCount_ && i < rooms_[selectedRoom_].device_count) { UiDevice &device = rooms_[selectedRoom_].devices[i]; const bool target = !device.is_on; queueDevice(device, target); ESP_LOGI(TAG, "device_toggle room=%s device=%s state=%s", rooms_[selectedRoom_].name, device.name, target ? "on" : "off"); } break; }
+        case TouchZone::DETAIL_PREVIOUS:
+            if (roomDevicePage_ > 0) { --roomDevicePage_; dirty_ = true; dirtyRegion_ = {}; }
+            break;
+        case TouchZone::DETAIL_NEXT:
+            if (rooms_ && selectedRoom_ < roomCount_ &&
+                (roomDevicePage_ + 1) * DETAIL_DEVICE_PAGE_SIZE < rooms_[selectedRoom_].device_count) {
+                ++roomDevicePage_; dirty_ = true; dirtyRegion_ = {};
+            }
+            break;
+        case TouchZone::DETAIL_DEVICE_0: case TouchZone::DETAIL_DEVICE_1: case TouchZone::DETAIL_DEVICE_2:
+        case TouchZone::DETAIL_DEVICE_3: case TouchZone::DETAIL_DEVICE_4: case TouchZone::DETAIL_DEVICE_5: {
+            if (!rooms_ || selectedRoom_ >= roomCount_) break;
+            UiRoom &room = rooms_[selectedRoom_];
+            const size_t slot = static_cast<uint8_t>(zone) - static_cast<uint8_t>(TouchZone::DETAIL_DEVICE_0);
+            const size_t index = roomDevicePage_ * DETAIL_DEVICE_PAGE_SIZE + slot;
+            if (index >= room.device_count) break;
+            UiDevice &device = room.devices[index];
+            const bool target = !device.is_on;
+            queueDevice(device, target);
+            ESP_LOGI(TAG, "device_toggle room=%s device=%s state=%s", room.name, device.name, target ? "on" : "off");
+            break;
+        }
         case TouchZone::SETTINGS_BACK: showHome(); break;
         case TouchZone::SETTINGS_CONFIGURE: beginOnboarding(); break;
         case TouchZone::SETTINGS_RESCAN: beginOnboarding(); break;

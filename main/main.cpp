@@ -864,22 +864,27 @@ private:
         if (control_config_serial_take_config_update()) {
             const uint32_t activeConfigId = control_config_serial_take_active_config_id();
             MatterPostCommissioningResult cached;
-            if (matter_controller_load_device_cache(cached) == ESP_OK) {
-                matterPostResult_ = cached;
+            if (matter_controller_load_device_cache(cached) == ESP_OK) matterPostResult_ = cached;
+            else cached = matterPostResult_;
+            if (!cached.savedNode.node_id) (void)matter_controller_load_saved_node(cached.savedNode);
+            if (dashboardAvailable_) {
                 UiConfig config;
-                if (control_ui_config_load(config) == ESP_OK && dashboardAvailable_) {
+                const esp_err_t configErr = control_ui_config_load(config);
+                if (configErr == ESP_OK) {
                     controlUi_.bindPersistedDevices(cached.savedNode.node_id, cached.devices, config);
                     ESP_LOGI("CONTROL_CONFIG", "active_config_updated id=%u rooms=%u devices=%u",
                              static_cast<unsigned>(activeConfigId), static_cast<unsigned>(config.room_count),
                              static_cast<unsigned>(config.binding_count));
                     ESP_LOGI("CONTROL_UI", "config_updated");
-                    if (state_ == AppState::WEATHER_HOME) renderUi("config_updated");
-                } else if (dashboardAvailable_) {
+                } else if (configErr == ESP_ERR_NOT_FOUND) {
+                    controlUi_.bindPersistedDevices(cached.savedNode.node_id, cached.devices, UiConfig{});
 #if CONFIG_CONTROL_UI_DEVICE_ONBOARDING
                     controlUi_.beginOnboarding();
-                    if (state_ == AppState::WEATHER_HOME) renderUi("config_updated");
 #endif
+                } else {
+                    ESP_LOGW("CONTROL_CONFIG", "config_update_failed err=%s keeping_current_ui=yes", esp_err_to_name(configErr));
                 }
+                if (state_ == AppState::WEATHER_HOME) renderUi("config_updated");
             }
         }
         if (changed && state_ == AppState::WEATHER_HOME) renderUi("matter_ui_command_complete");

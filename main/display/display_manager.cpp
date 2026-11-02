@@ -76,10 +76,9 @@ std::string DisplayManager::fitTextToWidth(const std::string &value, int maxWidt
     constexpr const char *ELLIPSIS = "...";
     std::string fitted = value;
     while (!fitted.empty() && textWidth(fitted + ELLIPSIS) > maxWidth) {
-        fitted.pop_back();
-        while (!fitted.empty() && (static_cast<unsigned char>(fitted.back()) & 0xC0) == 0x80) {
-            fitted.pop_back();
-        }
+        size_t end = fitted.size() - 1;
+        while (end > 0 && (static_cast<unsigned char>(fitted[end]) & 0xC0) == 0x80) --end;
+        fitted.resize(end);
     }
     return fitted.empty() ? std::string(ELLIPSIS) : fitted + ELLIPSIS;
 }
@@ -177,6 +176,11 @@ bool DisplayManager::commitFull(const char *stateName) {
     }
     ESP_LOGI(TAG, "framebuffer_non_white=%u/%u", static_cast<unsigned>(non_white),
              static_cast<unsigned>(FRAMEBUFFER_SIZE));
+    if (non_white == 0) {
+        ESP_LOGE(TAG, "empty frame rejected state=%s", stateName ? stateName : "unknown");
+        refreshState_ = RefreshState::READY;
+        return false;
+    }
     epd_poweron();
     epd_clear();
     const esp_err_t drawErr = epd_draw_grayscale_image(epd_full_screen(), framebuffer_);
